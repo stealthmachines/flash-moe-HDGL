@@ -128,6 +128,7 @@ typedef struct {
     double cmd2_encode;      // CMD2 encode (o_proj + residual + norm + routing)
     double cmd2_wait;        // CMD2 commit + waitUntilCompleted
     double routing_cpu;      // CPU softmax + topK
+    double spec_route;       // speculative early routing (gate matvec + topK)
     double expert_io;        // parallel pread + cache lookup
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
     double total;            // total per-layer time
@@ -158,6 +159,7 @@ static void timing_print(void) {
     fprintf(stderr, "  input_norm:     %6.3f\n", g_timing.input_norm / n);
     fprintf(stderr, "  cmd1_submit:    %6.3f\n", g_timing.cmd1_submit / n);
     fprintf(stderr, "  cmd1_wait:      %6.3f\n", g_timing.cmd1_wait / n);
+    fprintf(stderr, "  spec_route:     %6.3f\n", g_timing.spec_route / n);
     fprintf(stderr, "  cpu_attn:       %6.3f\n", g_timing.cpu_attn / n);
     fprintf(stderr, "  cmd2_encode:    %6.3f\n", g_timing.cmd2_encode / n);
     fprintf(stderr, "  cmd2_wait:      %6.3f\n", g_timing.cmd2_wait / n);
@@ -167,7 +169,8 @@ static void timing_print(void) {
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
-             g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn +
+             g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.spec_route +
+             g_timing.cpu_attn +
              g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu +
              g_timing.expert_io + g_timing.cmd3_encode) / n);
     fprintf(stderr, "  cmd_buffers:    %d (3 per layer: CMD1+CMD2+CMD3)\n", n * 3);
@@ -2850,6 +2853,11 @@ typedef struct {
 
 static ExpertLRUCache *g_expert_cache = NULL;
 
+// Speculative early routing stats
+static uint64_t g_spec_route_attempts = 0;   // total speculative routing attempts
+static uint64_t g_spec_route_hits = 0;        // correctly predicted experts (found in cache at real routing time)
+static uint64_t g_spec_route_preloads = 0;    // async preloads initiated (cache misses at speculation time)
+
 static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
     cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
@@ -3473,6 +3481,9 @@ static float *s_attn_proj = NULL;   // [HIDDEN_DIM]
 static float *s_h_post    = NULL;   // [HIDDEN_DIM]
 static float *s_h_mid     = NULL;   // [HIDDEN_DIM]
 static float *s_gate_scores = NULL; // [NUM_EXPERTS]
+static float *s_spec_gate_scores = NULL; // [NUM_EXPERTS] speculative routing scratch
+static int s_spec_indices[MAX_K];         // speculative routing predicted expert indices
+static int s_spec_count = 0;              // number of speculative predictions this layer
 static float *s_shared_gate = NULL; // [SHARED_INTERMEDIATE]
 static float *s_shared_up  = NULL;  // [SHARED_INTERMEDIATE]
 static float *s_moe_out   = NULL;   // [HIDDEN_DIM]
@@ -3494,6 +3505,7 @@ static void init_layer_scratch(void) {
     s_h_post     = calloc(HIDDEN_DIM, sizeof(float));
     s_h_mid      = calloc(HIDDEN_DIM, sizeof(float));
     s_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
+    s_spec_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
     s_shared_gate = calloc(SHARED_INTERMEDIATE, sizeof(float));
     s_shared_up  = calloc(SHARED_INTERMEDIATE, sizeof(float));
     s_moe_out    = calloc(HIDDEN_DIM, sizeof(float));
@@ -3612,6 +3624,90 @@ static void fused_layer_forward(
         gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+
+    // =====================================================================
+    // SPECULATIVE EARLY ROUTING — overlap expert I/O with CPU attention
+    // =====================================================================
+    // Compute approximate routing using the PRE-attention normed hidden state.
+    // The real routing (in CMD2/PHASE 3) uses the POST-attention state, so this
+    // is an approximation. Fire off async pread for predicted cache misses via
+    // dispatch_group so the I/O runs concurrently with CPU attention compute.
+    // After CPU attention, we wait for the group to finish. When the real routing
+    // happens later, predicted experts are already in the LRU cache as hits.
+
+    dispatch_group_t spec_group = NULL;
+    int spec_preload_count = 0;
+    int spec_routing_enabled = 0;  // DISABLED: cache pollution + overhead makes it slower
+
+    if (g_timing_enabled) { t0 = now_ms(); }
+    s_spec_count = 0;
+
+    if (spec_routing_enabled && (g_expert_cache || g_malloc_cache) && packed_fd >= 0 && lc->gate_w) {
+        float *spec_scores = s_spec_gate_scores;
+        memset(spec_scores, 0, NUM_EXPERTS * sizeof(float));
+
+        // Gate projection matvec on pre-attention normed input (CPU, ~0.1ms for 512x4096)
+        cpu_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
+                           normed, spec_scores,
+                           NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
+        cpu_softmax(spec_scores, NUM_EXPERTS);
+
+        int spec_K = (K > MAX_K) ? MAX_K : K;
+        float spec_weights[MAX_K];
+        cpu_topk(spec_scores, NUM_EXPERTS, spec_K, s_spec_indices, spec_weights);
+        s_spec_count = spec_K;
+
+        g_spec_route_attempts += spec_K;
+
+        // Initialize GCD queue if needed
+        if (!g_io_gcd_queue)
+            g_io_gcd_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+
+        // Check cache for each predicted expert, start async I/O for misses
+        if (g_malloc_cache) {
+            spec_group = dispatch_group_create();
+            for (int k = 0; k < spec_K; k++) {
+                int eidx = s_spec_indices[k];
+                id<MTLBuffer> cached = malloc_cache_lookup(g_malloc_cache, layer_idx, eidx);
+                if (!cached) {
+                    int cidx = -1;
+                    id<MTLBuffer> buf = malloc_cache_insert(g_malloc_cache, layer_idx, eidx, &cidx);
+                    if (buf && cidx >= 0) {
+                        int fd_copy = packed_fd;
+                        void *dst = g_malloc_cache->data[cidx];
+                        off_t offset = (off_t)eidx * EXPERT_SIZE;
+                        dispatch_group_async(spec_group, g_io_gcd_queue, ^{
+                            pread(fd_copy, dst, EXPERT_SIZE, offset);
+                        });
+                        spec_preload_count++;
+                        g_spec_route_preloads++;
+                    }
+                }
+            }
+        } else if (g_expert_cache) {
+            spec_group = dispatch_group_create();
+            for (int k = 0; k < spec_K; k++) {
+                int eidx = s_spec_indices[k];
+                id<MTLBuffer> cached = expert_cache_lookup(g_expert_cache, layer_idx, eidx);
+                if (!cached) {
+                    id<MTLBuffer> buf = expert_cache_insert(g_expert_cache, layer_idx, eidx);
+                    if (buf) {
+                        int fd_copy = packed_fd;
+                        void *dst = [buf contents];
+                        off_t offset = (off_t)eidx * EXPERT_SIZE;
+                        dispatch_group_async(spec_group, g_io_gcd_queue, ^{
+                            pread(fd_copy, dst, EXPERT_SIZE, offset);
+                        });
+                        spec_preload_count++;
+                        g_spec_route_preloads++;
+                    }
+                }
+            }
+        }
+    }
+    (void)spec_preload_count;  // tracked via g_spec_route_preloads
+
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.spec_route += t1 - t0; }
 
     // =====================================================================
     // PHASE 2: CPU attention compute
@@ -3926,6 +4022,12 @@ static void fused_layer_forward(
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_attn += t1 - t0; }
 
+    // Wait for speculative expert I/O to complete (overlapped with CPU attention)
+    if (spec_group) {
+        dispatch_group_wait(spec_group, DISPATCH_TIME_FOREVER);
+        spec_group = NULL;  // ARC releases the group
+    }
+
     if (g_timing_enabled) { t0 = now_ms(); }
 
     float *h_post = s_h_post;
@@ -4204,6 +4306,20 @@ static void fused_layer_forward(
         }
         if (layer_idx == 0) g_freq_total_tokens++;
     }
+
+    // Track speculative routing prediction accuracy
+    if (s_spec_count > 0) {
+        int cmp_K = (K > MAX_K) ? MAX_K : K;
+        for (int s = 0; s < s_spec_count; s++) {
+            for (int r = 0; r < cmp_K; r++) {
+                if (s_spec_indices[s] == expert_indices[r]) {
+                    g_spec_route_hits++;
+                    break;
+                }
+            }
+        }
+    }
+
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
 
     // ---- Parallel pread + GPU experts ----
@@ -5010,6 +5126,13 @@ int main(int argc, char **argv) {
                    g_expert_cache->hits, g_expert_cache->misses,
                    total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
                    g_expert_cache->num_entries, g_expert_cache->max_entries);
+        }
+
+        if (g_spec_route_attempts > 0) {
+            printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
+                   g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
+                   g_spec_route_attempts > 0
+                       ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
         }
 
         if (g_freq_tracking) freq_print_analysis(K);

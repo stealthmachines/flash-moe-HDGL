@@ -4,3 +4,5 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.79	0	5.5	keep	C/METAL: BLAS delta-net (
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.56	0	5.5	discard	mmap expert files: CATASTROPHIC 5x regression. Per-page faults 100x slower than pread for uncached 7MB experts.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.10	0	5.5	discard	Malloc zero-copy cache 2581 entries (18GB): 52% hit but GPU memory pressure + page cache loss = slower
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.77	0	5.5	discard	Malloc zero-copy cache 500 entries (3.5GB): 37% hit, still slower than Metal LRU (2.93 vs 3.14)
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.70	0	5.5	discard	Speculative early routing: 53% prediction accuracy but cache pollution + overhead = 38% slower
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.67	0	5.5	discard	F_RDADVISE kernel hints: no improvement, added syscall overhead
