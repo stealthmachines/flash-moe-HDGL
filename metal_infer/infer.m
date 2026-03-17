@@ -16,11 +16,13 @@
  * Command buffer optimization (fused_layer_forward):
  *   Per-layer Metal command buffer structure:
  *     CMD1: attention input projections (3-4 dispatches, 1 commit)
- *     CPU:  attention compute (RoPE/softmax/delta-net) + o_proj
- *     CMD2: routing + shared expert gate/up (4 dispatches, 1 commit)
+ *     CPU:  attention compute (RoPE/softmax/delta-net)
+ *     CMD2: o_proj + residual_add + rms_norm + routing + shared gate/up (8 encoders, 1 commit)
+ *           GPU handles residual connection and post-attn norm internally,
+ *           eliminating the CPU round-trip that previously split this into 2 cmd buffers.
  *     CPU:  softmax + top-K + pread all K experts
  *     CMD3: all K expert forwards + shared SwiGLU + shared down (1 commit)
- *   Total: 3 cmd buffers per layer (was 4+K=8 for K=4).
+ *   Total: 3 cmd buffers per layer (was 4 before fusing o_proj+norm+routing).
  *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
  *
@@ -582,6 +584,8 @@ typedef struct {
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
+    id<MTLComputePipelineState> rms_norm_apply_bf16;
+    id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
@@ -613,6 +617,10 @@ typedef struct {
     id<MTLBuffer> buf_shared_up;     // [SHARED_INTERMEDIATE floats]
     id<MTLBuffer> buf_shared_act;    // [SHARED_INTERMEDIATE floats] (SwiGLU output)
     id<MTLBuffer> buf_shared_out;    // [HIDDEN_DIM floats] (down_proj output)
+    // Fused o_proj+norm+routing buffers (eliminates 1 cmd buffer per layer)
+    id<MTLBuffer> buf_residual;     // [HIDDEN_DIM floats] holds residual for GPU add
+    id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
+    id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -671,6 +679,8 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
+    ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
+    ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
@@ -741,6 +751,14 @@ static MetalCtx *metal_setup(void) {
                                                     options:MTLResourceStorageModeShared];
     ctx->buf_shared_out  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
+
+    // Fused o_proj+norm+routing buffers
+    ctx->buf_residual = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_h_mid    = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_sum_sq   = [ctx->device newBufferWithLength:sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -2870,10 +2888,11 @@ static void fused_layer_forward(
     }
 
     // =====================================================================
-    // PHASE 3: FUSED CMD2 — o_proj + routing + shared expert (1 cmd buffer)
-    //   Eliminates 1 GPU round-trip per layer (was 2 separate cmd buffers).
-    //   Uses batch_out[6] as alternative input buffer for o_proj, while
-    //   buf_input holds h_post for routing. All 5 dispatches in ONE commit.
+    // PHASE 3: FULLY FUSED CMD2 — o_proj + residual + norm + routing (1 cmd buffer)
+    //   Eliminates 1 GPU round-trip vs old 2-buffer approach.
+    //   GPU handles residual_add + rms_norm between o_proj and routing,
+    //   so no CPU intervention is needed. 8 encoders, 1 commit+wait.
+    //   Buffer flow: batch_out[6]->buf_output->buf_h_mid->buf_input->batch_out[0-3]
     // =====================================================================
 
     float *h_post = s_h_post;
@@ -2890,37 +2909,36 @@ static void fused_layer_forward(
                             suw && sus && sub && seg_w && seg_s && seg_b);
 
     if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b &&
-        g_metal && g_metal->wf_buf && have_moe_weights) {
-        // ---- FUSED: o_proj + routing + shared in ONE command buffer ----
-        // Strategy: use batch_out[6] as input for o_proj (alternative input buf),
-        //           buf_input for h_post (routing input).
-        //           buf_output for o_proj result.
-        //           batch_out[0-3] for routing results (as usual).
+        g_metal && g_metal->wf_buf && have_moe_weights &&
+        g_metal->residual_add && g_metal->rms_norm_sum &&
+        g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
+        // ---- FULLY FUSED: o_proj + residual + norm + routing in ONE cmd buffer ----
+        // Previous approach used 2 cmd buffers (cmd_oproj + cmd_route) with CPU
+        // residual_add + rms_norm in between. Now ALL operations run on GPU:
+        //   Enc 1: o_proj matvec (batch_out[6] -> buf_output)
+        //   Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid)
+        //   Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq)
+        //   Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input)
+        //   Enc 5-8: routing gate + shared expert gate/up/gate_score (buf_input -> batch_out[0-3])
+        // Metal guarantees sequential execution between encoders in one cmd buffer.
 
-        // Copy o_proj input into batch_out[6] (used as alternative input buffer)
+        // Copy o_proj input into batch_out[6] (alternative input buffer)
         memcpy([g_metal->batch_out[6] contents], attn_out_for_oproj,
                oproj_in_dim * sizeof(float));
+        // Copy residual into GPU buffer for residual_add kernel
+        memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
 
-        // Compute h_post from o_proj result on GPU? No -- need CPU residual first.
-        // But wait: we can compute o_proj, residual, norm, THEN submit routing.
-        // That requires waiting for o_proj. So true fusion requires a different approach.
-        //
-        // True fusion: encode o_proj into cmd buffer, then ALSO encode routing.
-        // But routing needs h_post which depends on o_proj result.
-        // GPU executes encoders in order, but the ROUTING encoders need h_post
-        // in buf_input, which requires CPU to compute norm(residual + o_proj_result).
-        //
-        // We CANNOT fuse these because the CPU must intervene between o_proj and routing.
-        // So: submit o_proj non-blocking, do CPU work, wait, then submit routing.
+        attn_out_for_oproj = NULL;
 
-        // CMD2a: o_proj (non-blocking)
-        id<MTLCommandBuffer> cmd_oproj = [g_metal->queue commandBuffer];
+        id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
+
+        // ---- Enc 1: o_proj matvec ----
         {
             NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
 
-            id<MTLComputeCommandEncoder> enc = [cmd_oproj computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
@@ -2937,42 +2955,77 @@ static void fused_layer_forward(
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             [enc endEncoding];
         }
-        [cmd_oproj commit];  // NON-BLOCKING: GPU starts o_proj
 
-        // ---- CPU work while GPU runs o_proj ----
-        // attn_out_for_oproj is a static buffer — no free needed
-        attn_out_for_oproj = NULL;
-
-        // Wait for o_proj GPU result
-        [cmd_oproj waitUntilCompleted];
-        memcpy(attn_projected, [g_metal->buf_output contents], HIDDEN_DIM * sizeof(float));
-
-        // Residual connection
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            hidden[i] = residual[i] + attn_projected[i];
+        // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM;
+            [enc setComputePipelineState:g_metal->residual_add];
+            [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
+            [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
+            [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
+            [enc setBytes:&dim length:4 atIndex:3];
+            uint32_t tgs = (dim + 255) / 256;
+            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
         }
-        cpu_vec_copy(h_mid, hidden, HIDDEN_DIM);
 
-        // Post-attention norm -> h_post
-        cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
+        // ---- Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq) ----
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM;
+            [enc setComputePipelineState:g_metal->rms_norm_sum];
+            [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+            [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+            [enc setBytes:&dim length:4 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
 
-        // CMD2b: routing + shared expert (4 dispatches, 1 commit)
+        // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
+        {
+            NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
+                                               (const char *)[g_metal->wf_buf contents]);
+            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+            uint32_t dim = HIDDEN_DIM;
+            float eps = RMS_NORM_EPS;
+            [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+            [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];  // x
+            [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1]; // weight (bf16)
+            [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];  // sum_sq
+            [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];  // out = h_post
+            [enc setBytes:&dim length:4 atIndex:4];
+            [enc setBytes:&eps length:4 atIndex:5];
+            uint32_t tgs = (dim + 255) / 256;
+            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
         BatchMatvecSpec moe_specs[4] = {
             { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
             { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
             { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
             { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
         };
+        // buf_input already contains h_post from Enc 4 output -- no memcpy needed
+        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
 
-        // Use encode-only API to avoid another commit+wait inside fast_batch_matvec
-        memcpy([g_metal->buf_input contents], h_post, HIDDEN_DIM * sizeof(float));
-        id<MTLCommandBuffer> cmd_route = [g_metal->queue commandBuffer];
-        gpu_encode_batch_matvec(g_metal, cmd_route, moe_specs, 4);
-        [cmd_route commit];
-        [cmd_route waitUntilCompleted];
+        // ---- Single commit+wait for all 8 encoders ----
+        [cmd_fused commit];
+        [cmd_fused waitUntilCompleted];
+
+        // Read back results
         gpu_flush_batch_results(g_metal, moe_specs, 4);
-
-        // attn_projected, normed, residual are static — no free needed
+        // Read h_mid from GPU buffer (needed for final combine)
+        memcpy(h_mid, [g_metal->buf_h_mid contents], HIDDEN_DIM * sizeof(float));
+        // Read h_post from buf_input (needed for expert input)
+        memcpy(h_post, [g_metal->buf_input contents], HIDDEN_DIM * sizeof(float));
+        // Update hidden state to h_mid (= residual + o_proj)
+        memcpy(hidden, h_mid, HIDDEN_DIM * sizeof(float));
 
     } else {
         // ---- Non-fused fallback path ----

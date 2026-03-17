@@ -636,3 +636,46 @@ kernel void rms_norm_apply(
     float rms = rsqrt(sum_sq[0] / float(dim) + eps);
     out[tid] = x[tid] * rms * weight[tid];
 }
+
+
+// ============================================================================
+// Kernel 4b: RMS Normalization with bf16 weights
+// ============================================================================
+// Same as rms_norm_apply but reads weights as bfloat16 (uint16_t) and
+// converts to float32 inline. Used in the fused o_proj+norm+routing path
+// where norm weights come directly from the mmap'd weight file (bf16).
+
+kernel void rms_norm_apply_bf16(
+    device const float*    x       [[buffer(0)]],
+    device const uint16_t* weight  [[buffer(1)]],  // bf16 weights
+    device const float*    sum_sq  [[buffer(2)]],
+    device float*          out     [[buffer(3)]],
+    constant uint&         dim     [[buffer(4)]],
+    constant float&        eps     [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    float rms = rsqrt(sum_sq[0] / float(dim) + eps);
+    float w = bf16_to_f32(weight[tid]);
+    out[tid] = x[tid] * rms * w;
+}
+
+
+// ============================================================================
+// Kernel 5: Residual add
+// ============================================================================
+// out[i] = a[i] + b[i]
+// Used to fuse the residual connection into a GPU command buffer,
+// eliminating a CPU round-trip between o_proj and routing.
+
+kernel void residual_add(
+    device const float* a   [[buffer(0)]],
+    device const float* b   [[buffer(1)]],
+    device float*       out [[buffer(2)]],
+    constant uint&      dim [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    out[tid] = a[tid] + b[tid];
+}
