@@ -679,3 +679,178 @@ kernel void residual_add(
     if (tid >= dim) return;
     out[tid] = a[tid] + b[tid];
 }
+
+
+// ============================================================================
+// Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
+// ============================================================================
+//
+// Computes scores[h, p] = sum_d(Q[h, d] * K[p, kv_h*head_dim + d]) * scale
+// for all heads h in [0, num_heads) and positions p in [0, seq_len).
+//
+// Grid: linearized (pos + h * num_seq_tgs) — one threadgroup per (position, head).
+// Each threadgroup of 256 threads reduces over head_dim=256.
+//
+// GQA mapping: kv_head = h / heads_per_kv (e.g. 16 query heads share 1 KV head)
+//
+// Output layout: scores[h * seq_stride + p] where seq_stride = MAX_SEQ_LEN
+
+kernel void attn_scores_batched(
+    device const float* Q          [[buffer(0)]],  // [num_heads, head_dim]
+    device const float* K_cache    [[buffer(1)]],  // [max_seq, kv_dim]
+    device float*       scores     [[buffer(2)]],  // [num_heads, seq_stride]
+    constant uint&      head_dim   [[buffer(3)]],  // 256
+    constant uint&      kv_dim     [[buffer(4)]],  // 512
+    constant uint&      seq_len    [[buffer(5)]],  // current seq length
+    constant uint&      seq_stride [[buffer(6)]],  // MAX_SEQ_LEN
+    constant float&     scale      [[buffer(7)]],  // 1/sqrt(head_dim)
+    constant uint&      heads_per_kv [[buffer(8)]], // 16 (GQA ratio)
+    constant uint&      num_seq_tgs  [[buffer(9)]],  // = seq_len
+    uint tgid  [[threadgroup_position_in_grid]],    // linearized: pos + h * num_seq_tgs
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint pos = tgid % num_seq_tgs;
+    uint h = tgid / num_seq_tgs;
+    if (pos >= seq_len) return;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* qh = Q + h * head_dim;
+    device const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
+
+    float acc = 0.0f;
+    for (uint d = lid; d < head_dim; d += tg_size) {
+        acc += qh[d] * kp[d];
+    }
+
+    // SIMD reduction
+    float simd_val = simd_sum(acc);
+    threadgroup float shared[32];
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = simd_sum(shared[simd_lane]);
+        if (simd_lane == 0) {
+            scores[h * seq_stride + pos] = val * scale;
+        }
+    }
+}
+
+
+// ============================================================================
+// Kernel 7: Batched softmax — one threadgroup per head
+// ============================================================================
+
+kernel void attn_softmax_batched(
+    device float*    scores     [[buffer(0)]],  // [num_heads, seq_stride]
+    constant uint&   seq_len    [[buffer(1)]],
+    constant uint&   seq_stride [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],     // head index
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    device float* s = scores + tgid * seq_stride;
+
+    // Pass 1: find max
+    threadgroup float shared_max[32];
+    float local_max = -1e30f;
+    for (uint i = lid; i < seq_len; i += tg_size) {
+        local_max = max(local_max, s[i]);
+    }
+    float sm = simd_max(local_max);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared_max[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -1e30f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_max = simd_max(shared_max[simd_lane]);
+    }
+    threadgroup float broadcast_max;
+    if (lid == 0) broadcast_max = global_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = broadcast_max;
+
+    // Pass 2: exp and sum
+    threadgroup float shared_sum[32];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < seq_len; i += tg_size) {
+        float val = exp(s[i] - global_max);
+        s[i] = val;
+        local_sum += val;
+    }
+    float simd_s = simd_sum(local_sum);
+    if (simd_lane == 0) shared_sum[simd_group] = simd_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        global_sum = simd_sum(shared_sum[simd_lane]);
+    }
+    threadgroup float broadcast_sum;
+    if (lid == 0) broadcast_sum = global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_sum = broadcast_sum;
+
+    // Pass 3: normalize
+    float inv_sum = 1.0f / global_sum;
+    for (uint i = lid; i < seq_len; i += tg_size) {
+        s[i] *= inv_sum;
+    }
+}
+
+
+// ============================================================================
+// Kernel 8: Batched attention value aggregation (scores @ V) — all heads
+// ============================================================================
+//
+// For each head h: output[h*head_dim + d] = sum_p(scores[h*seq_stride+p] * V[p*kv_dim + kv_h*head_dim + d])
+//
+// Grid: linearized over (head_dim * num_heads) — one thread per (dimension, head).
+
+kernel void attn_values_batched(
+    device const float* scores   [[buffer(0)]],  // [num_heads, seq_stride]
+    device const float* V_cache  [[buffer(1)]],  // [max_seq, kv_dim]
+    device float*       out      [[buffer(2)]],  // [num_heads, head_dim]
+    constant uint&      head_dim  [[buffer(3)]],  // 256
+    constant uint&      kv_dim    [[buffer(4)]],  // 512
+    constant uint&      seq_len   [[buffer(5)]],
+    constant uint&      seq_stride [[buffer(6)]],
+    constant uint&      heads_per_kv [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]          // linearized: d + h * head_dim
+) {
+    uint d = tid % head_dim;
+    uint h = tid / head_dim;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* s = scores + h * seq_stride;
+
+    float acc = 0.0f;
+    for (uint p = 0; p < seq_len; p++) {
+        acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
+    }
+    out[h * head_dim + d] = acc;
+}
+
+
+// ============================================================================
+// Kernel 9: Sigmoid element-wise gate
+// ============================================================================
+// out[i] = x[i] * sigmoid(gate[i])
+
+kernel void sigmoid_gate(
+    device float*       x_out  [[buffer(0)]],  // [dim] in/out
+    device const float* gate   [[buffer(1)]],  // [dim] gate values
+    constant uint&      dim    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    float g = 1.0f / (1.0f + exp(-gate[tid]));
+    x_out[tid] = x_out[tid] * g;
+}

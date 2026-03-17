@@ -20,11 +20,15 @@
  *     CMD2: o_proj + residual_add + rms_norm + routing + shared gate/up (8 encoders, 1 commit)
  *           GPU handles residual connection and post-attn norm internally,
  *           eliminating the CPU round-trip that previously split this into 2 cmd buffers.
- *     CPU:  softmax + top-K + pread all K experts
- *     CMD3: all K expert forwards + shared SwiGLU + shared down (1 commit)
- *   Total: 3 cmd buffers per layer (was 4 before fusing o_proj+norm+routing).
+ *     CPU:  softmax + top-K + pread all K experts (4 pthreads parallel)
+ *     CMD3: all K expert forwards + shared SwiGLU + shared down (DEFERRED commit)
+ *   Total: 3 cmd buffers per layer. CMD3 is submitted async (commit without wait).
+ *   The wait+combine for layer N's CMD3 happens at the START of layer N+1,
+ *   overlapping ~1ms of GPU expert compute with the next layer's attention+routing.
  *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
+ *   Double-buffered expert data (buf_multi_expert_data / data_B) for future
+ *   async pread overlap with GPU compute.
  *
  * Build:  clang -O2 -Wall -fobjc-arc -framework Metal -framework Foundation -lpthread infer.m -o infer
  * Run:    ./infer --prompt "Explain relativity" --tokens 50
@@ -82,6 +86,9 @@
 
 // Expert packed binary layout (from existing code)
 #define EXPERT_SIZE         7077888
+
+// KV cache maximum context length
+#define MAX_SEQ_LEN 4096
 
 // EOS token
 #define EOS_TOKEN_1         248046
@@ -587,6 +594,11 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
+    // GPU attention pipelines
+    id<MTLComputePipelineState> attn_scores_pipe;
+    id<MTLComputePipelineState> attn_softmax_pipe;
+    id<MTLComputePipelineState> attn_values_pipe;
+    id<MTLComputePipelineState> sigmoid_gate_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -604,8 +616,11 @@ typedef struct {
     // Multi-expert buffers: K independent sets so all experts can be encoded
     // into a SINGLE command buffer (no per-expert commit+wait).
     // Each expert k uses slot [k].
+    // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
+    // Gate/up/act/out only need one set (GPU uses them after pread completes).
     #define MAX_K 8
-    id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each
+    id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
+    id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
     id<MTLBuffer> buf_multi_expert_up[MAX_K];     // [MOE_INTERMEDIATE floats]
     id<MTLBuffer> buf_multi_expert_act[MAX_K];    // [MOE_INTERMEDIATE floats]
@@ -621,6 +636,14 @@ typedef struct {
     id<MTLBuffer> buf_residual;     // [HIDDEN_DIM floats] holds residual for GPU add
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
+    // GPU attention buffers (for full attention layers)
+    #define NUM_FULL_ATTN_LAYERS 15
+    id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
+    id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
+    id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
+    id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
+    id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -682,6 +705,10 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
+    ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
+    ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
+    ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
+    ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
@@ -726,12 +753,14 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_expert_out   = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
 
-    // Multi-expert buffers: K independent slots
+    // Multi-expert buffers: K independent slots (double-buffered data)
     ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
     for (int k = 0; k < MAX_K; k++) {
         ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithLength:EXPERT_SIZE
                                                                  options:MTLResourceStorageModeShared];
+        ctx->buf_multi_expert_data_B[k] = [ctx->device newBufferWithLength:EXPERT_SIZE
+                                                                   options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
@@ -759,6 +788,29 @@ static MetalCtx *metal_setup(void) {
                                                  options:MTLResourceStorageModeShared];
     ctx->buf_sum_sq   = [ctx->device newBufferWithLength:sizeof(float)
                                                  options:MTLResourceStorageModeShared];
+
+    // GPU attention buffers
+    {
+        size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;  // 512
+        size_t kv_cache_size = MAX_SEQ_LEN * kv_dim * sizeof(float);
+        for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+            ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                        options:MTLResourceStorageModeShared];
+            ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
+                                                        options:MTLResourceStorageModeShared];
+        }
+        ctx->buf_attn_q      = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_out    = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
+               NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
+               (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -1116,6 +1168,98 @@ static void gpu_encode_expert_forward_slot(
     }
 }
 
+// Encode one expert forward using explicit data buffer (for double buffering).
+// Expert data must already be in data_buf.
+// Input must already be in buf_multi_expert_input.
+// Uses slot k's gate/up/act/out scratch buffers.
+static void gpu_encode_expert_forward_slot_buf(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    int k,                  // slot index (for gate/up/act/out scratch)
+    id<MTLBuffer> data_buf  // expert weight data buffer (from either set A or B)
+) {
+    NSUInteger gate_w_off = 0;
+    NSUInteger gate_s_off = 2097152;
+    NSUInteger gate_b_off = 2228224;
+    NSUInteger up_w_off   = 2359296;
+    NSUInteger up_s_off   = 4456448;
+    NSUInteger up_b_off   = 4587520;
+    NSUInteger down_w_off = 4718592;
+    NSUInteger down_s_off = 6815744;
+    NSUInteger down_b_off = 6946816;
+
+    uint32_t gate_up_out = MOE_INTERMEDIATE;
+    uint32_t gate_up_in  = HIDDEN_DIM;
+    uint32_t down_out    = HIDDEN_DIM;
+    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gs          = GROUP_SIZE;
+
+    // gate_proj
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setBuffer:data_buf                        offset:gate_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:gate_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:gate_b_off  atIndex:2];
+        [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
+        [enc setBytes:&gate_up_out length:4 atIndex:5];
+        [enc setBytes:&gate_up_in  length:4 atIndex:6];
+        [enc setBytes:&gs          length:4 atIndex:7];
+        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // up_proj
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setBuffer:data_buf                        offset:up_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:up_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:up_b_off  atIndex:2];
+        [enc setBuffer:ctx->buf_multi_expert_input     offset:0          atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
+        [enc setBytes:&gate_up_out length:4 atIndex:5];
+        [enc setBytes:&gate_up_in  length:4 atIndex:6];
+        [enc setBytes:&gs          length:4 atIndex:7];
+        uint32_t num_tgs = (gate_up_out + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // SwiGLU
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->swiglu];
+        [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
+        [enc setBytes:&gate_up_out length:4 atIndex:3];
+        uint32_t swiglu_tgs = (gate_up_out + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    // down_proj
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:ctx->matvec_v3];
+        [enc setBuffer:data_buf                        offset:down_w_off  atIndex:0];
+        [enc setBuffer:data_buf                        offset:down_s_off  atIndex:1];
+        [enc setBuffer:data_buf                        offset:down_b_off  atIndex:2];
+        [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
+        [enc setBytes:&down_out length:4 atIndex:5];
+        [enc setBytes:&down_in  length:4 atIndex:6];
+        [enc setBytes:&gs       length:4 atIndex:7];
+        uint32_t num_tgs = (down_out + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
 // Encode one expert forward (gate+up+swiglu+down) into cmdbuf.
 // Expert data must already be in buf_expert_data.
 // Input must already be in buf_expert_input.
@@ -1391,8 +1535,6 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 // ============================================================================
 // KV Cache for full attention layers
 // ============================================================================
-
-#define MAX_SEQ_LEN 4096  // maximum context length we support
 
 typedef struct {
     float *k_cache;  // [max_seq, num_kv_heads * head_dim]
@@ -2336,6 +2478,192 @@ static int parallel_pread_experts(
 }
 
 // ============================================================================
+// Parallel pread into explicit buffer set (for double buffering).
+// Same as parallel_pread_experts but reads into caller-specified MTLBuffers.
+// ============================================================================
+static int parallel_pread_experts_into(
+    int packed_fd,
+    int *expert_indices,
+    int K,
+    id<MTLBuffer> __strong *dst_bufs,  // target Metal buffers (set A or B)
+    int *valid  // [MAX_K] output: 1 if expert loaded successfully
+) {
+    InferPreadTask tasks[MAX_K];
+    for (int k = 0; k < K; k++) {
+        tasks[k].fd = packed_fd;
+        tasks[k].dst = [dst_bufs[k] contents];
+        tasks[k].offset = (off_t)expert_indices[k] * EXPERT_SIZE;
+        tasks[k].size = EXPERT_SIZE;
+        tasks[k].result = 0;
+    }
+
+    int nthreads = (K < NUM_IO_THREADS) ? K : NUM_IO_THREADS;
+    pthread_t threads[NUM_IO_THREADS];
+    InferPreadThreadArg args[NUM_IO_THREADS];
+
+    for (int t = 0; t < nthreads; t++) {
+        args[t].tasks = tasks;
+        args[t].num_tasks = K;
+        args[t].thread_id = t;
+        pthread_create(&threads[t], NULL, infer_pread_thread_fn, &args[t]);
+    }
+    for (int t = 0; t < nthreads; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    int loaded = 0;
+    for (int k = 0; k < K; k++) {
+        valid[k] = (tasks[k].result == EXPERT_SIZE);
+        if (valid[k]) loaded++;
+        else {
+            fprintf(stderr, "WARNING: expert %d pread: %zd/%d\n",
+                    expert_indices[k], tasks[k].result, EXPERT_SIZE);
+        }
+    }
+    return loaded;
+}
+
+// ============================================================================
+// Background prefetch thread for double-buffered expert I/O (from main.m).
+// Runs pread on a background thread while main thread does GPU compute.
+// Uses pure C I/O plan to avoid ARC issues across threads.
+// ============================================================================
+
+typedef struct {
+    void *dst[MAX_K];       // raw pointers from [buf contents] (no ARC)
+    off_t offset[MAX_K];    // file offsets per expert
+    int K;                  // number of experts
+    int fd;                 // file descriptor for this layer
+    int valid[MAX_K];       // output: 1 if pread succeeded
+    int loaded;             // output: count of successfully loaded experts
+} InferIOPlan;
+
+typedef struct {
+    InferIOPlan plan;       // pre-built I/O plan (pure C, no ARC)
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int start;              // signal: set to 1 to start prefetch
+    int done;               // signal: set to 1 when prefetch complete
+    int shutdown;           // signal: set to 1 to exit thread
+} InferPrefetchCtx;
+
+static void *infer_prefetch_thread_fn(void *arg) {
+    InferPrefetchCtx *pf = (InferPrefetchCtx *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&pf->mutex);
+        while (!pf->start && !pf->shutdown) {
+            pthread_cond_wait(&pf->cond, &pf->mutex);
+        }
+        if (pf->shutdown) {
+            pthread_mutex_unlock(&pf->mutex);
+            break;
+        }
+        pf->start = 0;
+        pthread_mutex_unlock(&pf->mutex);
+
+        // Execute parallel pread (pure C, no ARC objects)
+        InferIOPlan *plan = &pf->plan;
+        InferPreadTask tasks[MAX_K];
+        for (int k = 0; k < plan->K; k++) {
+            tasks[k].fd = plan->fd;
+            tasks[k].dst = plan->dst[k];
+            tasks[k].offset = plan->offset[k];
+            tasks[k].size = EXPERT_SIZE;
+            tasks[k].result = 0;
+        }
+
+        int nthreads = (plan->K < NUM_IO_THREADS) ? plan->K : NUM_IO_THREADS;
+        pthread_t threads[NUM_IO_THREADS];
+        InferPreadThreadArg args[NUM_IO_THREADS];
+        for (int t = 0; t < nthreads; t++) {
+            args[t].tasks = tasks;
+            args[t].num_tasks = plan->K;
+            args[t].thread_id = t;
+            pthread_create(&threads[t], NULL, infer_pread_thread_fn, &args[t]);
+        }
+        for (int t = 0; t < nthreads; t++) {
+            pthread_join(threads[t], NULL);
+        }
+
+        plan->loaded = 0;
+        for (int k = 0; k < plan->K; k++) {
+            plan->valid[k] = (tasks[k].result == EXPERT_SIZE);
+            if (plan->valid[k]) plan->loaded++;
+        }
+
+        // Signal completion
+        pthread_mutex_lock(&pf->mutex);
+        pf->done = 1;
+        pthread_cond_signal(&pf->cond);
+        pthread_mutex_unlock(&pf->mutex);
+    }
+
+    return NULL;
+}
+
+// Build I/O plan on main thread (ARC-safe: extracts void* from id<MTLBuffer>),
+// then signal background prefetch thread.
+static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+                                  int *expert_indices, int K,
+                                  id<MTLBuffer> __strong *dst_bufs) {
+    pthread_mutex_lock(&pf->mutex);
+    InferIOPlan *plan = &pf->plan;
+    plan->fd = packed_fd;
+    plan->K = K;
+    for (int k = 0; k < K; k++) {
+        plan->dst[k] = [dst_bufs[k] contents];
+        plan->offset[k] = (off_t)expert_indices[k] * EXPERT_SIZE;
+        plan->valid[k] = 0;
+    }
+    plan->loaded = 0;
+    pf->done = 0;
+    pf->start = 1;
+    pthread_cond_signal(&pf->cond);
+    pthread_mutex_unlock(&pf->mutex);
+}
+
+// Wait for background prefetch to complete. Returns number of loaded experts.
+// Copies valid[] flags into caller's array.
+static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
+    pthread_mutex_lock(&pf->mutex);
+    while (!pf->done) {
+        pthread_cond_wait(&pf->cond, &pf->mutex);
+    }
+    int loaded = pf->plan.loaded;
+    for (int k = 0; k < K; k++) {
+        valid_out[k] = pf->plan.valid[k];
+    }
+    pthread_mutex_unlock(&pf->mutex);
+    return loaded;
+}
+
+static InferPrefetchCtx *g_prefetch = NULL;
+static pthread_t g_prefetch_tid;
+
+static void infer_prefetch_init(void) {
+    if (g_prefetch) return;
+    g_prefetch = calloc(1, sizeof(InferPrefetchCtx));
+    pthread_mutex_init(&g_prefetch->mutex, NULL);
+    pthread_cond_init(&g_prefetch->cond, NULL);
+    g_prefetch->shutdown = 0;
+    pthread_create(&g_prefetch_tid, NULL, infer_prefetch_thread_fn, g_prefetch);
+}
+
+static void infer_prefetch_shutdown(void) {
+    if (!g_prefetch) return;
+    pthread_mutex_lock(&g_prefetch->mutex);
+    g_prefetch->shutdown = 1;
+    pthread_cond_signal(&g_prefetch->cond);
+    pthread_mutex_unlock(&g_prefetch->mutex);
+    pthread_join(g_prefetch_tid, NULL);
+    pthread_mutex_destroy(&g_prefetch->mutex);
+    pthread_cond_destroy(&g_prefetch->cond);
+    free(g_prefetch);
+    g_prefetch = NULL;
+}
+
+// ============================================================================
 // Per-layer weight pointer cache — built once, eliminates 40+ snprintf+lookup
 // per layer per token. With 60 layers and 15 tokens = 36,000 lookups saved.
 // ============================================================================
@@ -2498,26 +2826,86 @@ static void build_layer_cache(WeightFile *wf) {
 }
 
 // ============================================================================
-// Fused layer forward: GPU/CPU overlap + parallel I/O pipeline
+// Deferred expert state: holds state for async GPU expert compute.
+// GPU experts are submitted async (commit without wait), and the wait+combine
+// happens at the start of the NEXT layer. This overlaps ~1ms of GPU expert
+// compute with the next layer's attention+routing CPU/GPU work.
+// ============================================================================
+
+typedef struct {
+    int active;                         // 1 if there's a deferred GPU expert to wait for
+    id<MTLCommandBuffer> cmd_experts;   // the async command buffer (committed but not waited)
+    float expert_weights[MAX_K];        // routing weights for weighted accumulation
+    int valid[MAX_K];                   // which experts loaded successfully
+    int actual_K;                       // number of experts
+    float h_mid[HIDDEN_DIM];            // saved h_mid for final combine
+    float shared_gate_score;            // saved shared expert gate score
+    float *hidden;                      // pointer to hidden state (for writing final result)
+} DeferredExpertState;
+
+static DeferredExpertState g_deferred = { .active = 0 };
+
+// Complete the deferred GPU expert compute: wait for GPU, read back, accumulate, combine.
+// Must be called before the next layer modifies static scratch buffers.
+static void complete_deferred_experts(void) {
+    if (!g_deferred.active) return;
+
+    // Wait for the async GPU expert command buffer
+    [g_deferred.cmd_experts waitUntilCompleted];
+
+    // Read back and accumulate routed expert outputs
+    float moe_out[HIDDEN_DIM];
+    memset(moe_out, 0, sizeof(moe_out));
+    for (int k = 0; k < g_deferred.actual_K; k++) {
+        if (!g_deferred.valid[k]) continue;
+        float *expert_result = (float *)[g_metal->buf_multi_expert_out[k] contents];
+        cpu_vec_madd(moe_out, expert_result, g_deferred.expert_weights[k], HIDDEN_DIM);
+    }
+
+    // Read shared expert result
+    float shared_out[HIDDEN_DIM];
+    memcpy(shared_out, [g_metal->buf_shared_out contents], HIDDEN_DIM * sizeof(float));
+
+    // Apply shared expert gate
+    float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
+    for (int i = 0; i < HIDDEN_DIM; i++) {
+        shared_out[i] *= shared_weight;
+    }
+
+    // Final combine: hidden = h_mid + moe_out + shared_out
+    for (int i = 0; i < HIDDEN_DIM; i++) {
+        g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
+    }
+
+    g_deferred.active = 0;
+    g_deferred.cmd_experts = nil;
+}
+
+// ============================================================================
+// Fused layer forward: GPU/CPU overlap + deferred expert pipeline
 //
-// Pipeline per layer (2 cmd buffers, I/O overlapped with GPU):
+// Pipeline per layer (3 cmd buffers, deferred expert compute):
+//   [DEFERRED] Wait for PREVIOUS layer's CMD3 (if any) + combine results
 //   CMD1: attention projections (non-blocking commit)
-//   CPU:  [overlap] nothing yet (CMD1 is fast, ~1ms GPU)
 //   WAIT: CMD1 complete
 //   CPU:  attention compute (RoPE/softmax/delta-net)
-//   CMD2: o_proj + routing gate + shared expert projections (5 dispatches)
-//         (non-blocking commit)
-//   CPU:  [overlap with CMD2] prepare nothing (CMD2 ~1ms)
+//   CMD2: o_proj + residual + norm + routing + shared expert projs (8 encoders, 1 commit)
 //   WAIT: CMD2 complete
 //   CPU:  softmax + top-K routing
 //   I/O:  parallel pread K experts (4 pthreads)
-//   CMD3: K expert forwards + shared SwiGLU + shared down (1 commit+wait)
+//   CMD3: K expert forwards + shared SwiGLU + shared down (ASYNC commit, NO wait)
+//   SAVE: deferred state (expert_weights, valid[], h_mid, shared_gate_score)
+//   RETURN: GPU experts running async, overlapped with next layer's work
 //
-// Key optimizations vs previous version:
+// Cross-layer overlap: CMD3 for layer N runs on GPU while layer N+1
+// executes CMD1 + CPU attention + CMD2 + CPU routing (~3.5ms of work).
+// Since CMD3 takes ~1ms, it's always done by the time we need results.
+// Saves ~1ms per layer = ~60ms per token at 60 layers.
+//
+// Key optimizations:
 //   1. Parallel pread (4 threads) instead of sequential: ~4x I/O speedup
-//   2. o_proj fused into CMD2 with routing (saves 1 commit+wait = ~0.3ms)
-//   3. Total: 3 cmd buffers per layer (same count, but 1 fewer commit+wait
-//      from fusing o_proj into routing batch)
+//   2. o_proj fused into CMD2 with routing (saves 1 commit+wait)
+//   3. Deferred CMD3 (expert GPU compute overlapped with next layer)
 // ============================================================================
 
 // Static scratch buffers — allocated once, reused across all 60 layers per token.
@@ -2571,6 +2959,11 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    // Complete any deferred GPU expert compute from the previous layer.
+    // By now, the GPU has had ~3.5ms of the current layer's attention+routing
+    // to finish the previous layer's ~1ms expert compute — always done.
+    complete_deferred_experts();
+
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
@@ -2725,44 +3118,68 @@ static void fused_layer_forward(
         // RoPE
         apply_rotary_emb(q, k_out, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
 
-        // Update KV cache
+        // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+
+        int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                   k_out, kv_dim * sizeof(float));
+            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                   v_out, kv_dim * sizeof(float));
+        }
         kv->len++;
 
-        // Scaled dot-product attention (GQA)
+        // Scaled dot-product attention (GQA) — GPU or CPU
         int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
         float scale = 1.0f / sqrtf((float)HEAD_DIM);
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
-        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-            int kv_h = h / heads_per_kv;
-            float *qh = q + h * HEAD_DIM;
-            float *scores = malloc(kv->len * sizeof(float));
-            for (int p = 0; p < kv->len; p++) {
-                float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-                float dot = 0.0f;
-                for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
-                scores[p] = dot * scale;
+        // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
+        // Only enabled when seq_len >= 32 (below that, CPU is faster).
+        int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
+                              fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
+                              kv->len >= 32);
+
+        if (gpu_attn_ready) {
+            // Copy Q and gate to GPU; attention dispatches will be in CMD2
+            memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
+            memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
+            // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
+        } else {
+            // CPU fallback
+            for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+                int kv_h = h / heads_per_kv;
+                float *qh = q + h * HEAD_DIM;
+                float *scores = malloc(kv->len * sizeof(float));
+                for (int p = 0; p < kv->len; p++) {
+                    float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+                    float dot = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
+                    scores[p] = dot * scale;
+                }
+                cpu_softmax(scores, kv->len);
+                float *oh = attn_out + h * HEAD_DIM;
+                for (int p = 0; p < kv->len; p++) {
+                    float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                }
+                free(scores);
             }
-            cpu_softmax(scores, kv->len);
-            float *oh = attn_out + h * HEAD_DIM;
-            for (int p = 0; p < kv->len; p++) {
-                float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-                for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+            for (int i = 0; i < q_dim; i++) {
+                float g = 1.0f / (1.0f + expf(-q_gate[i]));
+                attn_out[i] *= g;
             }
-            free(scores);
         }
 
-        // Apply sigmoid gate
-        for (int i = 0; i < q_dim; i++) {
-            float g = 1.0f / (1.0f + expf(-q_gate[i]));
-            attn_out[i] *= g;
+        if (gpu_attn_ready) {
+            attn_out_for_oproj = NULL;  // signal CMD2 to use GPU buf_attn_out
+        } else {
+            attn_out_for_oproj = attn_out;
         }
-
-        attn_out_for_oproj = attn_out;
         // q, q_gate, attn_out are static — no free needed
         free(q_proj_out);
         free(k_out);
@@ -2908,23 +3325,37 @@ static void fused_layer_forward(
     int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
                             suw && sus && sub && seg_w && seg_s && seg_b);
 
-    if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b &&
+    // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
+    // Only enabled when seq_len >= 32 — below that, CPU attention is faster
+    // because GPU command encoder overhead dominates at short sequences.
+    int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
+                         && kv && kv->len >= 32);
+
+    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
-        // ---- FULLY FUSED: o_proj + residual + norm + routing in ONE cmd buffer ----
-        // Previous approach used 2 cmd buffers (cmd_oproj + cmd_route) with CPU
-        // residual_add + rms_norm in between. Now ALL operations run on GPU:
-        //   Enc 1: o_proj matvec (batch_out[6] -> buf_output)
-        //   Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid)
-        //   Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq)
-        //   Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input)
-        //   Enc 5-8: routing gate + shared expert gate/up/gate_score (buf_input -> batch_out[0-3])
-        // Metal guarantees sequential execution between encoders in one cmd buffer.
+        // ---- FULLY FUSED CMD2 ----
+        // For GPU attention (full-attn layers): attention dispatches are prepended,
+        //   o_proj reads from buf_attn_out instead of batch_out[6].
+        // For CPU attention / linear attn: o_proj reads from batch_out[6] as before.
+        //
+        // GPU attn path (12 encoders):
+        //   Enc 1-4: attn_scores + softmax + values + sigmoid -> buf_attn_out
+        //   Enc 5:   o_proj (buf_attn_out -> buf_output)
+        //   Enc 6-8: residual + norm -> buf_input
+        //   Enc 9-12: routing + shared expert
+        //
+        // CPU attn path (8 encoders, unchanged):
+        //   Enc 1:   o_proj (batch_out[6] -> buf_output)
+        //   Enc 2-4: residual + norm -> buf_input
+        //   Enc 5-8: routing + shared expert
 
-        // Copy o_proj input into batch_out[6] (alternative input buffer)
-        memcpy([g_metal->batch_out[6] contents], attn_out_for_oproj,
-               oproj_in_dim * sizeof(float));
+        if (!gpu_attn_fuse) {
+            // CPU/linear attn: copy attention output to GPU input buffer
+            memcpy([g_metal->batch_out[6] contents], attn_out_for_oproj,
+                   oproj_in_dim * sizeof(float));
+        }
         // Copy residual into GPU buffer for residual_add kernel
         memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
 
@@ -2932,22 +3363,101 @@ static void fused_layer_forward(
 
         id<MTLCommandBuffer> cmd_fused = [g_metal->queue commandBuffer];
 
-        // ---- Enc 1: o_proj matvec ----
+        // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
+        if (gpu_attn_fuse) {
+            int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
+            int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+            int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
+            float scale = 1.0f / sqrtf((float)HEAD_DIM);
+            uint32_t hd = HEAD_DIM;
+            uint32_t kvd = (uint32_t)kv_dim;
+            uint32_t sl = (uint32_t)kv->len;
+            uint32_t seq_stride = MAX_SEQ_LEN;
+            uint32_t hpkv = (uint32_t)heads_per_kv;
+
+            // Enc A1: attn_scores_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                [enc setBytes:&hd        length:4 atIndex:3];
+                [enc setBytes:&kvd       length:4 atIndex:4];
+                [enc setBytes:&sl        length:4 atIndex:5];
+                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setBytes:&scale     length:4 atIndex:7];
+                [enc setBytes:&hpkv      length:4 atIndex:8];
+                [enc setBytes:&sl        length:4 atIndex:9];
+                uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A2: attn_softmax_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_softmax_pipe];
+                [enc setBuffer:g_metal->buf_attn_scores offset:0 atIndex:0];
+                [enc setBytes:&sl         length:4 atIndex:1];
+                [enc setBytes:&seq_stride  length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A3: attn_values_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_values_pipe];
+                [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
+                [enc setBytes:&hd        length:4 atIndex:3];
+                [enc setBytes:&kvd       length:4 atIndex:4];
+                [enc setBytes:&sl        length:4 atIndex:5];
+                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setBytes:&hpkv      length:4 atIndex:7];
+                uint32_t total_threads = HEAD_DIM * NUM_ATTN_HEADS;
+                uint32_t tgs = (total_threads + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // Enc A4: sigmoid_gate
+            {
+                uint32_t qdim = NUM_ATTN_HEADS * HEAD_DIM;
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
+                [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
+                [enc setBytes:&qdim length:4 atIndex:2];
+                uint32_t tgs = (qdim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+        }
+
+        // ---- o_proj matvec ----
         {
             NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
             NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
             NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
+
+            // For GPU attention: o_proj reads from buf_attn_out
+            // For CPU attention: o_proj reads from batch_out[6]
+            id<MTLBuffer> oproj_input = gpu_attn_fuse ? g_metal->buf_attn_out : g_metal->batch_out[6];
 
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
             [enc setComputePipelineState:g_metal->matvec_fast];
-            [enc setBuffer:g_metal->wf_buf       offset:w_off atIndex:0];
-            [enc setBuffer:g_metal->wf_buf       offset:s_off atIndex:1];
-            [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:2];
-            [enc setBuffer:g_metal->batch_out[6]  offset:0    atIndex:3];  // alt input
-            [enc setBuffer:g_metal->buf_output    offset:0    atIndex:4];
+            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
+            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
+            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
+            [enc setBuffer:oproj_input      offset:0    atIndex:3];
+            [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
             [enc setBytes:&o_out_dim  length:4 atIndex:5];
             [enc setBytes:&o_in_dim   length:4 atIndex:6];
             [enc setBytes:&o_gs       length:4 atIndex:7];
@@ -3127,19 +3637,28 @@ static void fused_layer_forward(
                 HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
 
-        // Step 4: single commit+wait for all K experts + shared expert
+        // Step 4: DEFERRED commit — submit async, don't wait.
+        // The wait+combine happens at the start of the NEXT layer's
+        // fused_layer_forward(), overlapping ~1ms of GPU expert compute
+        // with the next layer's attention+routing work.
         [cmd_experts commit];
-        [cmd_experts waitUntilCompleted];
 
-        // Step 5: read back and accumulate
+        // Save state for deferred completion
+        g_deferred.active = 1;
+        g_deferred.cmd_experts = cmd_experts;
+        g_deferred.actual_K = actual_K;
+        g_deferred.shared_gate_score = shared_gate_score;
+        g_deferred.hidden = hidden;
+        memcpy(g_deferred.h_mid, h_mid, HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < actual_K; k++) {
-            if (!valid[k]) continue;
-            float *expert_result = (float *)[g_metal->buf_multi_expert_out[k] contents];
-            cpu_vec_madd(moe_out, expert_result, expert_weights[k], HIDDEN_DIM);
+            g_deferred.expert_weights[k] = expert_weights[k];
+            g_deferred.valid[k] = valid[k];
         }
 
-        // Read shared expert result
-        memcpy(shared_out, [g_metal->buf_shared_out contents], HIDDEN_DIM * sizeof(float));
+        // Return immediately — GPU experts are running async.
+        // The next call to fused_layer_forward() or complete_deferred_experts()
+        // will wait for the GPU and apply the final combine.
+        return;
 
     } else if (packed_fd >= 0) {
         // CPU fallback for experts
@@ -3463,6 +3982,8 @@ int main(int argc, char **argv) {
                                     is_full ? NULL : layer_states[layer],
                                     pos, K, layer_fds[layer]);
             }
+            // Complete last layer's deferred GPU experts before final norm
+            complete_deferred_experts();
 
             pos++;
 
@@ -3542,6 +4063,8 @@ int main(int argc, char **argv) {
                                     is_full ? NULL : layer_states[layer],
                                     pos, K, layer_fds[layer]);
             }
+            // Complete last layer's deferred GPU experts before final norm
+            complete_deferred_experts();
             pos++;
 
             // Final norm

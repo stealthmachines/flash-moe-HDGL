@@ -68,3 +68,4 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.85	12000	5.5	keep	C/METAL E2E QUALITY: 
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.04	0	5.5	keep	C/METAL FUSED: 3 cmd buffers/layer (was 8). Quality verified bit-perfect. 490ms/tok.
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	4.53	800	5.5	keep	C/METAL PIPELINE: "I am a 22 year old male" — 200ms/tok, 4.53 tok/s! Attention+MoE overlap!
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.29	0	5.5	keep	C/METAL: GPU norm+residual shaders, fused cmd buffers. Peak 5.29 tok/s. 189ms/tok.
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	5.24	1368	5.5	keep	C/METAL: parallel pread + async pipeline. Peak 5.24. 'the best way to make a cup of tea?'
