@@ -1,146 +1,119 @@
-# ANE Research — Pushing the Edges of LLM Inference on Apple Silicon
+# Flash-MoE: Running a 397B Parameter Model on a Laptop
 
-## Mission
+Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **5.5+ tokens/second** with production-quality output.
 
-Find the absolute biggest Qwen3.5 variant that runs on an M3 Max (48GB) with usable inference performance. Qwen3.5-27B already works — anything below 35B is useless. We're targeting 35B+ models, potentially up to 397B, using every lever available: flash offloading, MoE sparsity, ANE co-processing, speculative decoding.
+The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
 
-This follows the autoresearch paradigm: autonomous experimentation, measured results, iterative progress.
+## Results
+
+| Configuration | tok/s | Quality | Notes |
+|--------------|-------|---------|-------|
+| 2-bit experts, K=4 | **5.55** | Excellent | Current best. 120GB on disk. |
+| 4-bit experts, K=4 (warm) | 4.80 | Excellent | 209GB on disk. Page-cache dependent. |
+| 4-bit experts, K=4 (cold) | 2.83 | Excellent | Steady-state with cold cache. |
+| Peak single token | **7.05** | — | Warm cache, 2-bit. |
 
 ## Hardware
 
-- **Chip**: Apple M3 Max (16-core CPU: 12P + 4E, 40-core GPU, 16-core ANE)
-- **Memory**: 48 GB unified (~400 GB/s bandwidth, shared across CPU/GPU/ANE)
-- **SSD**: 1TB Apple Fabric, **17.5 GB/s sequential read** (measured), 335GB free
+- **Machine**: MacBook Pro, Apple M3 Max
+- **Chip**: 16-core CPU (12P + 4E), 40-core GPU, 16-core ANE
+- **Memory**: 48 GB unified (~400 GB/s bandwidth)
+- **SSD**: 1TB Apple Fabric, **17.5 GB/s sequential read** (measured)
 - **macOS**: 26.2 (Darwin 25.2.0)
-- **ANE**: 16-core, ~16 TFLOPS FP16 (claimed ~6x inference perf — to validate)
 
-## Target Models
+## Architecture
 
-| Model | Total Params | Active Params | 4-bit Size | Fits DRAM? |
-|-------|-------------|---------------|------------|------------|
-| Qwen3.5-35B-A3B | 35B | 3B | ~18GB | Yes |
-| Qwen3.5-122B-A10B | 122B | 10B | ~61GB | No |
-| Qwen3.5-397B-A17B | 397B | 17B | ~198GB | No |
+The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 standard full attention. Each layer has 512 experts, of which K=4 are activated per token (plus one shared expert). Hidden dimension is 4096.
 
-mlx-community has pre-quantized 4-bit versions. We use MLX as our inference engine.
+### Key Techniques
 
-## The Levers
+1. **SSD Expert Streaming** — Expert weights (120GB total at 2-bit) are read from NVMe SSD on demand via parallel `pread()`. Only the K=4 active experts per layer are loaded (~3.9MB each). Inspired by Apple's "LLM in a Flash" paper.
 
-1. **Flash offloading** (LLM in a Flash) — stream weights from SSD instead of holding all in DRAM
-2. **MoE sparsity** — only active experts needed per token (3-17B of 35-397B total)
-3. **Selective persistence** — pin attention + routing in DRAM, stream expert FFN from flash
-4. **Expert caching** — sliding window keeps recently-used experts in DRAM
-5. **ANE co-processing** — offload attention to ANE while GPU handles expert FFN
-6. **Speculative decoding** — draft with fast small model, verify with big model
+2. **2-bit Expert Quantization** — Custom requantization from MLX's 4-bit affine format to 2-bit affine (16 values per uint32). 44% size reduction with RMSE ~0.001. Quality preserved across math, code, and reasoning tasks.
 
-## Safety Constraint
+3. **Metal Compute Shaders** — Hand-written Metal kernels for:
+   - 4-bit and 2-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache)
+   - Fused SwiGLU activation
+   - RMS normalization (two-pass: sum-of-squares reduction + apply)
+   - Batched GPU attention (Q@K^T, softmax, scores@V) for full attention layers
+   - GPU RoPE (fused with Q deinterleave and K normalization)
+   - MoE combine + residual + sigmoid gate (fused kernel)
 
-This is the primary machine. **NO experiments that risk OOM or system instability.** We stream weights explicitly, control memory usage, and release pages after use. Never hold more than ~20-25GB of model weights in DRAM at once.
+4. **Deferred GPU Expert Compute** — CMD3 (expert forward pass) is submitted without waiting. The GPU executes it while the CPU prepares the next layer. The combine + residual + norm are also on GPU, feeding directly into the next layer's attention projections.
 
-## Autoresearch Protocol
+5. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
 
-### The 5-Minute Rule (HARD CONSTRAINT)
+6. **F_NOCACHE for Direct SSD Access** — Bypasses the OS page cache for expert files when using 2-bit mode. With 120GB >> 35GB available cache, page caching thrashes. Direct I/O avoids eviction overhead.
 
-Every experiment gets a **5-minute wall-clock budget**. Non-negotiable:
-- If not showing results within 5 minutes, kill it and move on
-- Timeout = crash, log it, revert, next idea
-
-### The Loop
-
-LOOP FOREVER:
-1. **Hypothesis** — what to try and why
-2. **Implement** — write the code change
-3. **git commit** — snapshot before running
-4. **Run** — execute with 5-minute timeout
-5. **Read results** — extract metrics
-6. **Decide** — keep (improved) / discard (regressed) / crash (failed)
-7. **Log** — append to results.tsv
-8. **GOTO 1** — never stop, never ask
-
-### Metrics & results.tsv
+### Pipeline Per Layer (3.14ms average at 2-bit)
 
 ```
-commit	model	params_B	active_B	tok_sec	ttft_ms	mem_gb	status	description
+CMD3(prev) → CMD1: attention projections  [0.87ms GPU]
+           → CPU: GatedDeltaNet / full attention  [0.27ms CPU+BLAS]
+           → CMD2: o_proj + residual + norm + routing + shared expert  [0.45ms GPU]
+           → CPU: softmax + topK routing  [0.003ms]
+           → I/O: parallel pread K=4 experts  [1.49ms SSD]
+           → CMD3: expert forward + combine + norm (DEFERRED)  [0.03ms encode]
 ```
 
-**"Improved" means**: bigger model running, OR same model faster (headroom to go bigger). North star: maximum params_B at usable tok/sec.
+## Quick Start
 
-### Rules
-- **Never stop** — run until interrupted
-- **Never ask** — no "should I continue?"
-- **Simplicity wins** — ugly complexity for marginal gains isn't worth it
-- **Safety first** — no OOM, no system instability
-- **Crashes are data** — log them and move on
+```bash
+cd metal_infer
+make
+# 4-bit inference (needs packed_experts/ directory)
+./infer --prompt "Explain quantum computing" --tokens 100
+
+# 2-bit inference (44% faster, needs packed_experts_2bit/)
+./infer --prompt "Explain quantum computing" --tokens 100 --2bit
+
+# Interactive chat
+./chat --2bit
+```
 
 ## Project Structure
 
 ```
-CLAUDE.md                   # this file
-pyproject.toml              # uv project (mlx, mlx-lm, safetensors, psutil)
-bench.py                    # MLX inference benchmark (tok/sec, memory)
-stream_infer.py             # streaming inference engine (layer-by-layer, controlled mem)
-progress.py                 # visualization: results.tsv -> progress.png
-run.sh                      # 5-minute timeout wrapper
-results.tsv                 # experiment log (git-ignored)
-documentation/
-  autoresearch/             # karpathy's autoresearch reference
-  ANE/                      # maderix's ANE reverse-engineering project
-  2312.11514v3.pdf          # Apple's "LLM in a Flash" paper
+metal_infer/
+  infer.m              # Complete inference engine (~5000 lines)
+  shaders.metal        # Metal compute kernels (~1100 lines)
+  main.m               # MoE-only benchmark
+  Makefile             # Build system
+  extract_weights.py   # Creates model_weights.bin from safetensors
+  encode_prompt.py     # Text → token IDs via HuggingFace tokenizer
+  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
+  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
+  model_weights.json   # Tensor manifest
+  vocab.bin            # Vocabulary for token decoding
+
+stream_infer.py        # Reference Python/MLX implementation
+repack_experts.py      # 4-bit expert packing from safetensors
+progress.py            # Results visualization
+results.tsv            # Experiment log
 ```
 
-## Key Technical Context
+## What We Tried (and What Worked)
 
-### LLM in a Flash (Apple, 2023)
-- Store model on flash, load selectively to DRAM during inference
-- **Windowing**: cache recently-activated neurons, load only incremental delta per token
-- **Row-column bundling**: bundle FFN up-projection columns with down-projection rows for larger sequential reads
-- **Selective persistence**: keep attention (~1/3 of model) always in DRAM
-- **Sparsity**: ReLU FFN layers have 90-97% sparsity — only 3-10% of weights needed
-- Result: models up to 2x DRAM size, 4-20x speedup over naive loading
+| Approach | Result | Verdict |
+|----------|--------|---------|
+| 2-bit expert quantization | +95% speed, quality preserved | **KEEP** |
+| GPU combine+norm in CMD3 | Eliminates CPU round-trip | **KEEP** |
+| BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **KEEP** |
+| F_NOCACHE for 2-bit | +3% from avoiding page thrash | **KEEP** |
+| GPU fused attention (RoPE kernels) | +2% for full-attn layers | **KEEP** |
+| Pre-allocated Metal LRU cache (500) | 35% hit rate, marginal for 2-bit | Neutral |
+| mmap expert files | 5x SLOWER (page fault overhead) | Reverted |
+| Metal cache >500 entries | GPU memory pressure kills perf | Reverted |
+| Malloc zero-copy cache (17GB) | Slower than Metal LRU | Reverted |
+| Speculative early routing | Cache pollution + overhead | Reverted |
+| GPU delta-net (195MB state) | Memory pressure > compute savings | Disabled |
+| CMD1+CMD2 merge via GPU RoPE | Dispatch overhead > sync savings | Reverted |
 
-### ANE Reference (maderix/ANE)
-- Reverse-engineered `_ANEClient` / `_ANECompiler` private APIs
-- Dynamic weight pipeline: 10 kernels compiled once, weights via IOSurface spatial packing
-- GPU+ANE zero-copy via shared IOSurface (demonstrated for inference)
-- Qwen3-0.6B training on ANE: 412 ms/step on M4
-- ANE peak: ~16 TFLOPS FP16 on M3
+## Safety
 
-### M3 Max Specific
-- Same 16-core NE as M3 Pro (Max adds GPU cores, not NE cores)
-- ANE dynamic pipeline uses matmul (not conv), so ch=512 constraint doesn't apply
-- MIL `program(1.3)` / `ios18` format works
-- 17.5 GB/s SSD read = 3x faster than M1 Max in the LLM-in-a-Flash paper
-
-## Experimental Results
-
-### Qwen3.5-35B-A3B (4-bit, ~19GB — fits in 48GB DRAM)
-
-Architecture: 40 layers (30 linear attention/SSM + 10 full attention), 256 experts, 8 active per token, hidden=2048
-
-| Mode | tok/s | Peak Mem | Notes |
-|------|-------|----------|-------|
-| baseline | 6.87 | 9.5 GB | mlx_lm native stream_generate |
-| layerwise | 9.38 | 8.4 GB | manual forward, per-layer mx.eval() |
-| stream | 3.42 | 13.2 GB | reload from safetensors per layer per token |
-| lazy (20tok) | 5.34 | 18.3 GB | mmap, OS pages on demand |
-| lazy (50tok) | 10.84 | 18.2 GB | ~43 tok/s generation after warmup |
-
-Key findings:
-- **SSD throughput**: 474MB/layer cold load in ~22ms = **~20 GB/s** (matches hardware spec)
-- **Warm (page-cached)**: ~1.5ms per layer (essentially free)
-- **Per-layer compute**: 0.54ms linear_attn, 0.51ms full_attn (generation phase)
-- **Lazy mode is best**: lowest initial memory (0.9 GB), OS manages paging efficiently
-- **Manual forward matches native exactly** (max logit diff = 0.0)
-
-### Expert Routing Analysis (35B)
-- Routing is **moderately diverse**: 43-57% of 256 experts activated across 30 tokens
-- Consecutive token overlap: 8-34% per layer (not very sticky)
-- LRU cache hit rates: 16-expert=49%, 32=59%, 64=68%, 128=71%
-- Implication: expert caching helps but doesn't eliminate SSD reads
-
-### 122B Memory Architecture
-- 48 layers (36 linear + 12 full), 256 experts, 8 active
-- **95% of model weight is MoE experts** (58GB of 61GB)
-- Active expert data per token: 1.81GB (out of 58GB)
-- Non-expert weights (attention, embed, norm, gate, lm_head): ~3GB
-- Strategy: pin 3GB non-expert, OS page cache handles expert paging
+This is a primary development machine. The engine explicitly controls memory:
+- Non-expert weights: 5.5GB (mmap'd, read-only)
+- Metal scratch buffers: ~200MB
+- Expert cache (optional): 0-3.5GB
+- Total: 6-9GB, leaving 39-42GB for OS + page cache
+- No OOM risk. Expert data streams from SSD on demand.
