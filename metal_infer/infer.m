@@ -2861,13 +2861,16 @@ static dispatch_queue_t g_io_gcd_queue = NULL;
 
 static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
     if (num_tasks == 0) return;
-    if (!g_io_gcd_queue)
-        g_io_gcd_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    // GCD dispatch_apply: zero-overhead parallel dispatch, blocks until done
-    dispatch_apply((size_t)num_tasks, g_io_gcd_queue, ^(size_t i) {
-        InferPreadTask *t = &tasks[i];
-        t->result = pread(t->fd, t->dst, t->size, t->offset);
-    });
+    pthread_mutex_lock(&g_io_pool.mutex);
+    g_io_pool.tasks = tasks;
+    g_io_pool.num_tasks = num_tasks;
+    g_io_pool.tasks_completed = 0;
+    g_io_pool.generation++;
+    pthread_cond_broadcast(&g_io_pool.work_ready);
+    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+        pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
+    }
+    pthread_mutex_unlock(&g_io_pool.mutex);
 }
 
 static void io_pool_shutdown(void) {
