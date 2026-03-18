@@ -309,25 +309,40 @@ static void md_print(const char *text) {
             continue;
         }
 
-        // Bullet lists at line start: - item or * item → • item
-        // Handle split tokens: marker may arrive alone, spaces in next token
-        if (g_md.line_start && c == '-' && (text[i+1] == ' ' || text[i+1] == '\0')) {
-            printf("  \033[33m•\033[0m");
-            if (text[i+1] == ' ') i++;
-            g_md.line_start = 0;
-            continue;
-        }
-        // * as bullet: when followed by space, end of token, OR multiple spaces
-        // Must NOT be ** (bold) — check that next non-space char isn't *
-        if (g_md.line_start && c == '*' && text[i+1] != '*') {
-            // Check if this looks like a bullet (followed by space or end of token)
-            if (text[i+1] == ' ' || text[i+1] == '\0' || text[i+1] == '\t') {
-                printf("  \033[33m•\033[0m");
-                // Skip trailing whitespace after the bullet marker
-                while (text[i+1] == ' ' || text[i+1] == '\t') i++;
-                g_md.line_start = 0;
-                continue;
+        // Bullet lists: - or * at line start (possibly indented with spaces)
+        // Count leading spaces for indent level, then check for bullet marker
+        if (g_md.line_start && (c == '-' || c == '*' || c == ' ')) {
+            // Peek ahead: count indent, find marker
+            int indent = 0;
+            int peek = i;
+            while (text[peek] == ' ' || text[peek] == '\t') { indent++; peek++; }
+            char marker = text[peek];
+            if ((marker == '-' || marker == '*') && marker != '\0') {
+                char after = text[peek + 1];
+                // Bullet: marker followed by space, end of token, or tab
+                // For *, must not be ** (bold)
+                if (marker == '-' && (after == ' ' || after == '\0')) {
+                    int depth = indent / 2;
+                    for (int d = 0; d < depth + 1; d++) printf("  ");
+                    printf("\033[33m•\033[0m ");
+                    i = peek + 1;
+                    while (text[i] == ' ' || text[i] == '\t') i++;
+                    i--; // loop will i++
+                    g_md.line_start = 0;
+                    continue;
+                }
+                if (marker == '*' && after != '*' && (after == ' ' || after == '\0' || after == '\t')) {
+                    int depth = indent / 2;
+                    for (int d = 0; d < depth + 1; d++) printf("  ");
+                    printf("\033[33m•\033[0m ");
+                    i = peek + 1;
+                    while (text[i] == ' ' || text[i] == '\t') i++;
+                    i--;
+                    g_md.line_start = 0;
+                    continue;
+                }
             }
+            // Not a bullet — fall through to normal handling
         }
 
         // Numbered lists at line start: 1. item → colored number
