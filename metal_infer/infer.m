@@ -181,13 +181,12 @@ static inline int expert_is_seen(int layer, int expert) {
 static inline void expert_mark_seen(int layer, int expert) {
     g_expert_seen[layer][expert >> 3] |= (1 << (expert & 7));
 }
-// Pick the right fd: warm (page cached) for seen experts, cold (F_NOCACHE) for new ones
+// Pick fd for expert read. Currently: always use warm fd (OS page cache).
+// Tiered I/O (cold F_NOCACHE for first reads) was tested but OS page cache
+// without any bypass outperforms all custom caching strategies.
 static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
-    if (g_layer_fds_cold && !expert_is_seen(layer, expert)) {
-        expert_mark_seen(layer, expert);
-        return g_layer_fds_cold[layer];  // first time: bypass page cache
-    }
-    return warm_fd;  // seen before: use page cache
+    (void)layer; (void)expert;
+    return warm_fd;
 }
 
 // Active expert size based on quantization mode
@@ -6012,7 +6011,7 @@ int main(int argc, char **argv) {
         const char *prompt_text = NULL;
         int max_tokens = 20;
         int K = 4;
-        int cache_entries = 2500;  // default 2500 entries (override with --cache-entries)
+        int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 

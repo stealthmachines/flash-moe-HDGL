@@ -8,3 +8,12 @@ progress.png
 logs/
 *.log
 .python-version
+
+# metal_infer generated files (large binaries)
+metal_infer/model_weights.bin
+metal_infer/model_weights.json
+metal_infer/vocab.bin
+metal_infer/metal_infer
+metal_infer/infer
+metal_infer/shaders.air
+metal_infer/shaders.metallib

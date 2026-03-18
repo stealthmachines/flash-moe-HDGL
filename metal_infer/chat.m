@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
         int K = 4;
-        int cache_entries = 2500;
+        int cache_entries = 0;  // trust OS page cache
         int malloc_cache_entries = 0;
 
         static struct option long_options[] = {
