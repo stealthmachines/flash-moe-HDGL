@@ -49,7 +49,7 @@ make
 ./chat --hdgl
 ```
 
-LICENSING - ALL LICENSING, AS APPLICABLE, for flash-moe-originating files retain their original licensing.  
+LICENSING - ALL LICENSING, AS APPLICABLE, for 'flash-moe' original files retain their original licensing.  
 
 All files diverging at time of publication of this repo remain property of ZCHG.org persuant but not limited to - https://zchg.org/t/legal-notice-copyright-applicable-ip-and-licensing-read-me/440
 
