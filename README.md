@@ -49,6 +49,42 @@ make
 ./chat --hdgl
 ```
 
+# Flash-MOE Classic Fuctionality
+```bash
+# 4-bit inference (needs packed_experts/ directory)
+./infer --prompt "Explain quantum computing" --tokens 100
+
+# 2-bit inference (faster but breaks tool calling)
+./infer --prompt "Explain quantum computing" --tokens 100 --2bit
+
+# Interactive chat with tool calling
+./chat
+```
+
+# Per-layer timing breakdown
+```
+./infer --prompt "Hello" --tokens 20 --timing
+Project Structure
+metal_infer/
+  infer.m              # Complete inference engine (~7000 lines)
+  shaders.metal        # Metal compute kernels (~1200 lines)
+  chat.m               # Interactive chat TUI with tool calling
+  tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
+  main.m               # MoE-only benchmark
+  Makefile             # Build system
+  extract_weights.py   # Creates model_weights.bin from safetensors
+  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
+  train_predictor.py   # Expert routing prediction analysis
+  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
+  model_weights.json   # Tensor manifest
+  vocab.bin            # Vocabulary for token decoding
+  tokenizer.bin        # Pre-exported BPE tokenizer data
+
+repack_experts.py      # 4-bit expert packing from safetensors
+progress.py            # Results visualization (Q2/Q4 tracks)
+results.tsv            # Experiment log (58 experiments)
+```
+
 LICENSING - ALL LICENSING, AS APPLICABLE, for 'flash-moe' original files retain their original licensing.  
 
 All files diverging at time of publication of this repo remain property of ZCHG.org persuant but not limited to - https://zchg.org/t/legal-notice-copyright-applicable-ip-and-licensing-read-me/440
