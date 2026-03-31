@@ -47,6 +47,7 @@ make
 
 # 4. Interactive chat with HDGL mode
 ./chat --hdgl
+```
 
 LICENSING - ALL LICENSING, AS APPLICABLE, for flash-moe-originating files retain their original licensing.  
 
