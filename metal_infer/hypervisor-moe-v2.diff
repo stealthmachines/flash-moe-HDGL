@@ -1,0 +1,32 @@
+diff --git a/metal_infer/Makefile b/metal_infer/Makefile
+index 8f3c2a1..e9d4b7f 100644
+--- a/metal_infer/Makefile
++++ b/metal_infer/Makefile
+@@ -1,15 +1,22 @@
+ CC = clang
+ OBJC_FLAGS = -framework Metal -framework Foundation -O3 -fobjc-arc -mmacosx-version-min=14.0
+ METAL_FLAGS = -std=metal3.1 -O3
+ 
+-SOURCES = infer.m chat.m main.m tokenizer.h linenoise.c repack_experts_lz4.c
++EXTRA_C = hdgl_bootloaderz.c
++SOURCES = infer.m chat.m main.m tokenizer.h linenoise.c repack_experts_lz4.c $(EXTRA_C)
+ 
+ all: infer chat
+ 
+ infer: shaders.metallib
+-	$(CC) $(SOURCES) -o infer $(OBJC_FLAGS)
++	$(CC) $(SOURCES) -o infer $(OBJC_FLAGS)
+ 
+ chat: shaders.metallib
+-	$(CC) chat.m linenoise.c -o chat $(OBJC_FLAGS)
++	$(CC) chat.m linenoise.c $(EXTRA_C) -o chat $(OBJC_FLAGS)
+ 
+ shaders.metallib: shaders.metal
+ 	xcrun -sdk macosx metal -c shaders.metal -o shaders.air $(METAL_FLAGS)
+ 	xcrun -sdk macosx metallib shaders.air -o shaders.metallib
+ 
++hdgl_bootloaderz.o: hdgl_bootloaderz.c hdgl_bootloaderz.h
++	$(CC) -c hdgl_bootloaderz.c -o hdgl_bootloaderz.o -O3
++
+ clean:
+ 	rm -f infer chat *.o *.air *.metallib
