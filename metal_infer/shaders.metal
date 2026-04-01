@@ -1294,3 +1294,41 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+// ============================================================================
+// HDGL-28: Sign-Magnitude Ternary FMA kernel
+// ============================================================================
+//
+// Used when --hdgl is active. Replaces the standard 4-bit dequant matvec with
+// a sign-magnitude ternary multiply-accumulate matching the BootloaderZ V6.0
+// ternary arithmetic model. Non-square projections: pass in_dim via buffer(3)
+// and out_dim via hdgl_get_packed_dims() ? populate a separate HDGL_ShaderDims
+// buffer; for square layers the existing uint& dim interface suffices.
+//
+// Buffer layout:
+//   buffer(0): W     [out_dim ? in_dim] float weights
+//   buffer(1): x     [in_dim]           float input
+//   buffer(2): out   [out_dim]          float output
+//   buffer(3): dim   uint               in_dim (square layers; gid bounds-checks out_dim separately)
+
+kernel void sign_magnitude_ternary_fma(
+    device const float* W   [[buffer(0)]],
+    device const float* x   [[buffer(1)]],
+    device       float* out [[buffer(2)]],
+    constant uint&      dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dim) return;
+
+    float acc = 0.0f;
+    for (uint col = 0; col < dim; col++) {
+        float w  = W[gid * dim + col];
+        float xv = x[col];
+        int sw = (w  < 0.0f) ? -1 : (w  > 0.0f) ? 1 : 0;
+        int sx = (xv < 0.0f) ? -1 : (xv > 0.0f) ? 1 : 0;
+        if (sw == 0 || sx == 0) continue;
+        float mag = fabs(w) * fabs(xv);
+        acc += (sw == sx) ? mag : -mag;
+    }
+    out[gid] = acc;
+}

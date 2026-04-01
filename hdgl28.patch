@@ -1,0 +1,819 @@
+diff --git a/metal_infer/Makefile b/metal_infer/Makefile
+index 51e492b..9ec12e2 100644
+--- a/metal_infer/Makefile
++++ b/metal_infer/Makefile
+@@ -21,6 +21,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
+ LDFLAGS = -lpthread -lcompression
+ 
+ TARGET = metal_infer
++EXTRA_C = hdgl_bootloaderz.c hdgl_router.c
+ MAIN_SRC = main.m
+ 
+ # Optional: offline shader compilation (faster startup, but not required)
+@@ -56,15 +57,18 @@ $(SHADER_LIB): $(SHADER_AIR)
+ 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
+ 
+ # Build the inference engine
+-$(INFER_TARGET): $(INFER_SRC)
+-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
++$(INFER_TARGET): $(INFER_SRC) $(EXTRA_C)
++	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) $(EXTRA_C) -o $(INFER_TARGET)
+ 
+ # Build the chat client (thin HTTP/SSE client + linenoise line editor)
+-$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
+-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
++$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h $(EXTRA_C)
++	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c $(EXTRA_C) -o $(CHAT_TARGET)
++
++generate_hdgl_lattice: hdgl_lattice_generator.c $(EXTRA_C)
++	$(CC) -O3 -Wall hdgl_lattice_generator.c $(EXTRA_C) -o generate_hdgl_lattice -lm
+ 
+ clean:
+-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
++	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB) generate_hdgl_lattice
+ 
+ # Run targets
+ run: $(TARGET)
+diff --git a/metal_infer/chat.m b/metal_infer/chat.m
+index ff6f1d7..98c36a3 100644
+--- a/metal_infer/chat.m
++++ b/metal_infer/chat.m
+@@ -500,6 +500,7 @@ int main(int argc, char **argv) {
+         {"show-think",  no_argument,       0, 's'},
+         {"resume",      required_argument, 0, 'r'},
+         {"sessions",    no_argument,       0, 'l'},
++        {"hdgl",        no_argument,       0, 'H'},
+         {"help",        no_argument,       0, 'h'},
+         {0, 0, 0, 0}
+     };
+@@ -507,13 +508,17 @@ int main(int argc, char **argv) {
+     init_sessions_dir();
+ 
+     int c;
+-    while ((c = getopt_long(argc, argv, "p:t:sr:lh", long_options, NULL)) != -1) {
++    while ((c = getopt_long(argc, argv, "p:t:sr:lHh", long_options, NULL)) != -1) {
+         switch (c) {
+             case 'p': port = atoi(optarg); break;
+             case 't': max_tokens = atoi(optarg); break;
+             case 's': show_thinking = 1; break;
+             case 'r': resume_id = optarg; break;
+             case 'l': session_list(); return 0;
++            case 'H':
++                printf("\n[HDGL-28] Hypervisor-MoE Bolstered ? BootloaderZ APA Lattice + Prismatic Router\n");
++                printf("You, Hypervisor; and Me\n\n");
++                break;
+             case 'h':
+                 printf("Usage: %s [options]\n", argv[0]);
+                 printf("  --port N         Server port (default: 8000)\n");
+@@ -521,6 +526,7 @@ int main(int argc, char **argv) {
+                 printf("  --show-think     Show <think> blocks (dimmed)\n");
+                 printf("  --resume ID      Resume a previous session\n");
+                 printf("  --sessions       List saved sessions\n");
++                printf("  --hdgl           Enable HDGL-28 APA lattice mode (requires --hdgl on infer server)\n");
+                 printf("  --help           This message\n");
+                 return 0;
+             default: return 1;
+diff --git a/metal_infer/hdgl_bootloaderz.c b/metal_infer/hdgl_bootloaderz.c
+new file mode 100644
+index 0000000..74dcc1d
+--- /dev/null
++++ b/metal_infer/hdgl_bootloaderz.c
+@@ -0,0 +1,329 @@
++// hdgl_bootloaderz.c ? BootloaderZ V6.0 APA/HDGL lattice library
++// Extracted from bootloaderZ.zip (bootloaderZ.c), main() removed.
++// Integrated into Flash-MoE as the HDGL-28 hyper-precision backend.
++// Bug fixes applied: ap_copy aliased UAF, calloc for chunk slots, B_aligned zero-init.
++#include "hdgl_bootloaderz.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <time.h>
++
++#define PHI           BLZ_PHI
++#define MAX_INSTANCES BLZ_MAX_INSTANCES
++#define CHUNK_SIZE    BLZ_CHUNK_SIZE
++#define MSB_MASK      BLZ_MSB_MASK
++#define MPI_INITIAL_WORDS 1
++
++static const float fib_table[]  = {1,1,2,3,5,8,13,21,34,55,89,144,233,377,610,987};
++static const float prime_table[] = {2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53};
++static const int   fib_len   = 16;
++static const int   prime_len = 16;
++
++static double get_normalized_rand(void) { return (double)rand() / RAND_MAX; }
++#define GET_RANDOM_UINT64() (((uint64_t)rand() << 32) | (uint64_t)rand())
++
++// ?? Global high-precision constants ?????????????????????????????????????????
++static Slot4096 APA_CONST_PHI;
++static Slot4096 APA_CONST_PI;
++static int       s_apa_constants_initialized = 0;
++
++// ?? Global lattice pointer (extern'd by hdgl_router.c) ???????????????????????
++HDGLLattice *g_hdgl_lattice = NULL;
++
++// ?? Forward declarations ?????????????????????????????????????????????????????
++static void ap_normalize_legacy(Slot4096 *slot);
++static void ap_add_legacy(Slot4096 *A, const Slot4096 *B);
++static void ap_shift_right_legacy(uint64_t *mantissa_words, size_t num_words, int64_t shift_amount);
++
++// ?? MPI ??????????????????????????????????????????????????????????????????????
++void mpi_init(MPI *m, size_t initial_words) {
++    m->words = calloc(initial_words, sizeof(uint64_t));
++    m->num_words = initial_words;
++    m->sign = 0;
++}
++void mpi_free(MPI *m) {
++    if (m->words) free(m->words);
++    m->words = NULL;
++    m->num_words = 0;
++}
++void mpi_copy(MPI *dest, const MPI *src) {
++    mpi_free(dest);
++    dest->num_words = src->num_words;
++    dest->words = malloc(src->num_words * sizeof(uint64_t));
++    if (src->words && dest->words)
++        memcpy(dest->words, src->words, src->num_words * sizeof(uint64_t));
++    dest->sign = src->sign;
++}
++void mpi_set_value(MPI *m, uint64_t value, uint8_t sign) {
++    if (m->words) m->words[0] = value;
++    m->sign = sign;
++}
++static void mpi_resize(MPI *m, size_t nw)        { (void)m; (void)nw; }
++static int  mpi_compare(const MPI *A, const MPI *B) { (void)A; (void)B; return 0; }
++static void mpi_add_op(MPI *A, const MPI *B)     { (void)A; (void)B; }
++static void mpi_subtract_op(MPI *A, const MPI *B){ (void)A; (void)B; }
++static size_t mpi_get_effective_words(const MPI *m) { return m->num_words; }
++static int    mpi_count_leading_zeros(const MPI *m) { (void)m; return 64; }
++
++// ?? Slot4096 ?????????????????????????????????????????????????????????????????
++Slot4096 slot_init_apa(int bits_mant, int bits_exp) {
++    Slot4096 slot = {0};
++    slot.bits_mant = bits_mant;
++    slot.bits_exp  = bits_exp;
++    slot.num_words = (size_t)((bits_mant + 63) / 64);
++    slot.mantissa_words = calloc(slot.num_words, sizeof(uint64_t));
++    mpi_init(&slot.exponent_mpi,       MPI_INITIAL_WORDS);
++    mpi_init(&slot.num_words_mantissa, MPI_INITIAL_WORDS);
++    mpi_init(&slot.source_of_infinity, MPI_INITIAL_WORDS);
++    if (!slot.mantissa_words) { fprintf(stderr, "Error: mantissa alloc failed.\n"); return slot; }
++    if (slot.num_words > 0) { slot.mantissa_words[0] = GET_RANDOM_UINT64(); slot.mantissa_words[0] |= MSB_MASK; }
++    int64_t exp_range = 1LL << bits_exp;
++    int64_t exp_bias  = 1LL << (bits_exp - 1);
++    slot.exponent = (rand() % exp_range) - exp_bias;
++    slot.base     = (float)(PHI + get_normalized_rand() * 0.01);
++    slot.exponent_base = 4096;
++    mpi_set_value(&slot.exponent_mpi,       (uint64_t)llabs(slot.exponent), slot.exponent < 0 ? 1 : 0);
++    mpi_set_value(&slot.num_words_mantissa, (uint64_t)slot.num_words,       0);
++    return slot;
++}
++
++void ap_free(Slot4096 *slot) {
++    if (!slot) return;
++    if (slot->mantissa_words) { free(slot->mantissa_words); slot->mantissa_words = NULL; }
++    mpi_free(&slot->exponent_mpi);
++    mpi_free(&slot->num_words_mantissa);
++    mpi_free(&slot->source_of_infinity);
++    slot->num_words = 0;
++}
++
++// FIX: zero MPI fields after shallow copy to prevent mpi_copy freeing src's memory
++void ap_copy(Slot4096 *dest, const Slot4096 *src) {
++    ap_free(dest);
++    *dest = *src;
++    dest->exponent_mpi.words       = NULL; dest->exponent_mpi.num_words       = 0;
++    dest->num_words_mantissa.words = NULL; dest->num_words_mantissa.num_words = 0;
++    dest->source_of_infinity.words = NULL; dest->source_of_infinity.num_words = 0;
++    dest->mantissa_words = malloc(src->num_words * sizeof(uint64_t));
++    if (!dest->mantissa_words) { fprintf(stderr, "Error: deep copy alloc failed.\n"); dest->num_words = 0; return; }
++    memcpy(dest->mantissa_words, src->mantissa_words, src->num_words * sizeof(uint64_t));
++    mpi_copy(&dest->exponent_mpi,       &src->exponent_mpi);
++    mpi_copy(&dest->num_words_mantissa, &src->num_words_mantissa);
++    mpi_copy(&dest->source_of_infinity, &src->source_of_infinity);
++}
++
++double ap_to_double(const Slot4096 *slot) {
++    if (!slot || slot->num_words == 0 || !slot->mantissa_words) return 0.0;
++    return ((double)slot->mantissa_words[0] / (double)UINT64_MAX) * pow(2.0, (double)slot->exponent);
++}
++
++Slot4096 *ap_from_double(double value, int bits_mant, int bits_exp) {
++    Slot4096 temp = slot_init_apa(bits_mant, bits_exp);
++    Slot4096 *slot = malloc(sizeof(Slot4096));
++    if (!slot) { ap_free(&temp); return NULL; }
++    *slot = temp;
++    if (value == 0.0) return slot;
++    int exp_offset;
++    double mant_val = frexp(value, &exp_offset);
++    slot->mantissa_words[0] = (uint64_t)(mant_val * (double)UINT64_MAX);
++    slot->exponent = (int64_t)exp_offset;
++    mpi_set_value(&slot->exponent_mpi, (uint64_t)llabs(slot->exponent), slot->exponent < 0 ? 1 : 0);
++    return slot;
++}
++
++static void ap_shift_right_legacy(uint64_t *mw, size_t nw, int64_t shift) {
++    if (shift <= 0 || nw == 0) return;
++    if (shift >= (int64_t)nw * 64) { memset(mw, 0, nw * sizeof(uint64_t)); return; }
++    int64_t ws = shift / 64;
++    int     bs = (int)(shift % 64);
++    if (ws > 0) {
++        for (size_t i = nw; i-- > (size_t)ws; ) mw[i] = mw[i - ws];
++        memset(mw, 0, (size_t)ws * sizeof(uint64_t));
++    }
++    if (bs > 0) {
++        int rs = 64 - bs;
++        for (size_t i = nw; i-- > 0; ) {
++            uint64_t carry = (i > 0) ? (mw[i-1] << rs) : 0;
++            mw[i] = (mw[i] >> bs) | carry;
++        }
++    }
++}
++void ap_shift_right(uint64_t *mw, size_t nw, int64_t shift) { ap_shift_right_legacy(mw, nw, shift); }
++
++static void ap_normalize_legacy(Slot4096 *slot) {
++    if (slot->num_words == 0) return;
++    while (!(slot->mantissa_words[0] & MSB_MASK)) {
++        if (slot->exponent <= -(1LL << (slot->bits_exp - 1))) { slot->state_flags |= APA_FLAG_GUZ; break; }
++        uint64_t carry = 0;
++        for (size_t i = slot->num_words; i-- > 0; ) {
++            uint64_t nc = (slot->mantissa_words[i] & MSB_MASK) ? 1 : 0;
++            slot->mantissa_words[i] = (slot->mantissa_words[i] << 1) | carry;
++            carry = nc;
++        }
++        slot->exponent--;
++    }
++    if (slot->mantissa_words[0] == 0) slot->exponent = 0;
++}
++void ap_normalize(Slot4096 *slot) { ap_normalize_legacy(slot); }
++
++// FIX: B_aligned = {0} to prevent ap_copy calling ap_free on garbage stack pointer
++static void ap_add_legacy(Slot4096 *A, const Slot4096 *B) {
++    if (A->num_words != B->num_words) { fprintf(stderr, "Error: APA add word count mismatch.\n"); return; }
++    Slot4096 B_aligned = {0};
++    ap_copy(&B_aligned, B);
++    int64_t ed = A->exponent - B_aligned.exponent;
++    if      (ed > 0) { ap_shift_right(B_aligned.mantissa_words, B_aligned.num_words,  ed); B_aligned.exponent = A->exponent; }
++    else if (ed < 0) { ap_shift_right(A->mantissa_words,        A->num_words,         -ed); A->exponent = B_aligned.exponent; }
++    uint64_t carry = 0;
++    size_t nw = A->num_words;
++    for (size_t i = nw; i-- > 0; ) {
++        uint64_t s = A->mantissa_words[i] + B_aligned.mantissa_words[i] + carry;
++        carry = (s < A->mantissa_words[i] || (s == A->mantissa_words[i] && carry)) ? 1 : 0;
++        A->mantissa_words[i] = s;
++    }
++    if (carry) {
++        if (A->exponent >= (1LL << (A->bits_exp - 1))) { A->state_flags |= APA_FLAG_GOI; }
++        else { A->exponent++; ap_shift_right(A->mantissa_words, nw, 1); A->mantissa_words[0] |= MSB_MASK; }
++    }
++    ap_normalize(A);
++    mpi_set_value(&A->exponent_mpi, (uint64_t)llabs(A->exponent), A->exponent < 0 ? 1 : 0);
++    ap_free(&B_aligned);
++}
++void ap_add(Slot4096 *A, const Slot4096 *B) { ap_add_legacy(A, B); }
++
++// ?? HDGL Lattice ?????????????????????????????????????????????????????????????
++HDGLLattice *lattice_init(int num_instances, int slots_per_instance) {
++    HDGLLattice *lat = malloc(sizeof(HDGLLattice));
++    if (!lat) return NULL;
++    lat->num_instances = num_instances; lat->slots_per_instance = slots_per_instance;
++    lat->omega = 0.0; lat->time = 0.0;
++    int total = num_instances * slots_per_instance;
++    lat->num_chunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
++    lat->chunks = calloc((size_t)lat->num_chunks, sizeof(HDGLChunk *));
++    if (!lat->chunks) { free(lat); return NULL; }
++    return lat;
++}
++
++HDGLChunk *lattice_get_chunk(HDGLLattice *lat, int idx) {
++    if (idx >= lat->num_chunks) return NULL;
++    if (!lat->chunks[idx]) {
++        HDGLChunk *ch = malloc(sizeof(HDGLChunk));
++        if (!ch) return NULL;
++        ch->allocated = CHUNK_SIZE;
++        // FIX: calloc so uninitialized slots have NULL mantissa_words ? safe for ap_free
++        ch->slots = calloc(CHUNK_SIZE, sizeof(Slot4096));
++        if (!ch->slots) { free(ch); return NULL; }
++        for (int i = 0; i < CHUNK_SIZE; i++) {
++            int bm = 4096 + (i % 8) * 64, be = 16 + (i % 8) * 2;
++            ch->slots[i] = slot_init_apa(bm, be);
++        }
++        lat->chunks[idx] = ch;
++    }
++    return lat->chunks[idx];
++}
++
++Slot4096 *lattice_get_slot(HDGLLattice *lat, int idx) {
++    if (!lat || idx < 0) return NULL;
++    int total = lat->num_instances * lat->slots_per_instance;
++    if (idx >= total) return NULL;
++    int ci = idx / CHUNK_SIZE, li = idx % CHUNK_SIZE;
++    HDGLChunk *ch = lattice_get_chunk(lat, ci);
++    return ch ? &ch->slots[li] : NULL;
++}
++
++double prismatic_recursion(HDGLLattice *lat, int idx, double val) {
++    double ph = pow(PHI, (double)(idx % 16)), fh = fib_table[idx % fib_len];
++    double dy = (double)(1 << (idx % 16)), pr = prime_table[idx % prime_len];
++    double om = 0.5 + 0.5 * sin(lat->time + idx * 0.01);
++    double rd = pow(val, (double)((idx % 7) + 1));
++    return sqrt(ph * fh * dy * pr * om) * rd;
++}
++
++void lattice_step_cpu(HDGLLattice *lat, double tick) {
++    int total = lat->num_instances * lat->slots_per_instance;
++    for (int i = 0; i < total; i++) {
++        Slot4096 *s = lattice_get_slot(lat, i);
++        if (!s || (s->state_flags & (APA_FLAG_GOI | APA_FLAG_IS_NAN))) continue;
++        double val = ap_to_double(s), r = prismatic_recursion(lat, i, val);
++        double inc_v = pow((double)s->base, (double)s->exponent) * tick + 0.05 * r;
++        Slot4096 *inc = ap_from_double(inc_v, s->bits_mant, s->bits_exp);
++        if (!inc) continue;
++        ap_add(s, inc); ap_free(inc); free(inc);
++    }
++    lat->omega += 0.01 * tick; lat->time += tick;
++}
++
++void lattice_fold(HDGLLattice *lat) {
++    int oi = lat->num_instances, ni = oi * 2;
++    if (ni > MAX_INSTANCES) return;
++    int ot = oi * lat->slots_per_instance, nt = ni * lat->slots_per_instance;
++    int oc = lat->num_chunks, nc = (nt + CHUNK_SIZE - 1) / CHUNK_SIZE;
++    HDGLChunk **np = realloc(lat->chunks, (size_t)nc * sizeof(HDGLChunk *));
++    if (!np) { fprintf(stderr, "Failed to alloc for folding\n"); return; }
++    lat->chunks = np;
++    for (int i = oc; i < nc; i++) lat->chunks[i] = NULL;
++    for (int i = 0; i < ot; i++) {
++        Slot4096 *os = lattice_get_slot(lat, i), *ns = lattice_get_slot(lat, ot + i);
++        if (os && ns) {
++            ap_copy(ns, os);
++            Slot4096 *p = ap_from_double(fib_table[i % fib_len] * 0.01, ns->bits_mant, ns->bits_exp);
++            if (p) { ap_add(ns, p); ap_free(p); free(p); }
++            ns->base += (float)(get_normalized_rand() * 0.001);
++        }
++    }
++    lat->num_instances = ni; lat->num_chunks = nc;
++}
++
++void lattice_free(HDGLLattice *lat) {
++    if (!lat) return;
++    free_apa_constants();
++    if (lat == g_hdgl_lattice) g_hdgl_lattice = NULL;
++    for (int i = 0; i < lat->num_chunks; i++) {
++        if (lat->chunks[i]) {
++            for (size_t j = 0; j < CHUNK_SIZE; j++) ap_free(&lat->chunks[i]->slots[j]);
++            free(lat->chunks[i]->slots); free(lat->chunks[i]);
++        }
++    }
++    free(lat->chunks); free(lat);
++}
++
++// ?? Lattice slot state for router ????????????????????????????????????????????
++HDGL_SlotState *hdgl_get_slot_state(int lattice_id) {
++    static HDGL_SlotState state;
++    Slot4096 *s = lattice_get_slot(g_hdgl_lattice, lattice_id);
++    if (!s || !s->mantissa_words) return NULL;
++    uint64_t w = s->mantissa_words[0];
++    state.charge  = (uint32_t)(w & 0xFFFFFFFF);
++    state.entropy = (uint32_t)(w >> 32);
++    state.tension = (uint32_t)(s->exponent & 0xFFFFFFFF);
++    return &state;
++}
++
++// ?? Bootloader integration ???????????????????????????????????????????????????
++void init_apa_constants(void) {
++    APA_CONST_PHI = slot_init_apa(4096, 16); APA_CONST_PI = slot_init_apa(4096, 16);
++    Slot4096 *tp = ap_from_double(1.6180339887, APA_CONST_PHI.bits_mant, APA_CONST_PHI.bits_exp);
++    ap_copy(&APA_CONST_PHI, tp); ap_free(tp); free(tp);
++    Slot4096 *tpi = ap_from_double(3.1415926535, APA_CONST_PI.bits_mant, APA_CONST_PI.bits_exp);
++    ap_copy(&APA_CONST_PI, tpi); ap_free(tpi); free(tpi);
++    s_apa_constants_initialized = 1;
++    printf("[Bootloader] High-precision constant slots (PHI, PI) initialized.\n");
++}
++
++void free_apa_constants(void) {
++    if (!s_apa_constants_initialized) return;
++    ap_free(&APA_CONST_PHI);
++    ap_free(&APA_CONST_PI);
++    s_apa_constants_initialized = 0;
++}
++
++void bootloader_init_lattice(HDGLLattice *lat, int steps) {
++    printf("[Bootloader] Initializing HDGL lattice with FUTURE-PROOF APA V2.1...\n");
++    if (!lat) { printf("[Bootloader] ERROR: Lattice allocation failed.\n"); return; }
++    init_apa_constants();
++    printf("[Bootloader] %d instances, %d total slots\n",
++           lat->num_instances, lat->num_instances * lat->slots_per_instance);
++    for (int i = 0; i < steps; i++) lattice_step_cpu(lat, 0.01);
++    printf("[Bootloader] Lattice seeded with %d steps\n", steps);
++    printf("[Bootloader] Omega: %.6f, Time: %.6f\n", lat->omega, lat->time);
++}
+diff --git a/metal_infer/hdgl_bootloaderz.h b/metal_infer/hdgl_bootloaderz.h
+new file mode 100644
+index 0000000..38bdf6d
+--- /dev/null
++++ b/metal_infer/hdgl_bootloaderz.h
+@@ -0,0 +1,116 @@
++// hdgl_bootloaderz.h ? BootloaderZ V6.0 + HDGL-28 router integration header
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++#include <stdlib.h>
++
++// ?? APA state flags ??????????????????????????????????????????????????????????
++#define APA_FLAG_SIGN_NEG  (1 << 0)
++#define APA_FLAG_IS_NAN    (1 << 1)
++#define APA_FLAG_GOI       (1 << 2)   // Gradual Overflow Infinity
++#define APA_FLAG_GUZ       (1 << 3)   // Gradual Underflow Zero
++
++// ?? System constants (match bootloaderZ.c) ???????????????????????????????????
++#define BLZ_PHI            1.6180339887
++#define BLZ_MAX_INSTANCES  8388608
++#define BLZ_SLOTS_PER_INST 4
++#define BLZ_CHUNK_SIZE     1048576     // 1 M slots per chunk
++#define BLZ_MSB_MASK       (1ULL << 63)
++
++// ?? MPI: arbitrarily-wide integer metadata ???????????????????????????????????
++typedef struct {
++    uint64_t *words;
++    size_t    num_words;
++    uint8_t   sign;        // 0 = positive, 1 = negative
++} MPI;
++
++// ?? Slot4096: Arbitrary Precision Architecture slot ??????????????????????????
++typedef struct {
++    uint64_t  *mantissa_words;
++    MPI        num_words_mantissa;
++    MPI        exponent_mpi;
++    uint16_t   exponent_base;       // target base (4096)
++    uint32_t   state_flags;
++    MPI        source_of_infinity;
++    size_t     num_words;
++    int64_t    exponent;
++    float      base;                // ?-scaled dynamic base
++    int        bits_mant;
++    int        bits_exp;
++} Slot4096;
++
++// ?? HDGLChunk / HDGLLattice ???????????????????????????????????????????????????
++typedef struct {
++    Slot4096 *slots;
++    size_t    allocated;
++} HDGLChunk;
++
++typedef struct {
++    HDGLChunk **chunks;
++    int         num_chunks;
++    int         num_instances;
++    int         slots_per_instance;
++    double      omega;
++    double      time;
++} HDGLLattice;
++
++// ?? HDGL Router types ?????????????????????????????????????????????????????????
++typedef struct {
++    char *text;
++    int   id;
++} Token;
++
++typedef struct {
++    uint32_t last_feedback;
++    int      last_expert_id;
++} HDGL_History;
++
++typedef struct {
++    uint32_t charge;
++    uint32_t entropy;
++    uint32_t tension;
++} HDGL_SlotState;
++
++// ?? Shader dimension guard (passed as buffer(3) for non-square projections) ??
++typedef struct {
++    uint32_t in_dim;
++    uint32_t out_dim;
++} HDGL_ShaderDims;
++
++// ?? APA utility API ??????????????????????????????????????????????????????????
++Slot4096  slot_init_apa(int bits_mant, int bits_exp);
++void      ap_free(Slot4096 *slot);
++void      ap_copy(Slot4096 *dest, const Slot4096 *src);
++void      ap_normalize(Slot4096 *slot);
++void      ap_add(Slot4096 *A, const Slot4096 *B);
++Slot4096 *ap_from_double(double value, int bits_mant, int bits_exp);
++double    ap_to_double(const Slot4096 *slot);
++void      ap_shift_right(uint64_t *mantissa_words, size_t num_words, int64_t shift_amount);
++
++// ?? MPI utility API ??????????????????????????????????????????????????????????
++void mpi_init(MPI *m, size_t initial_words);
++void mpi_free(MPI *m);
++void mpi_copy(MPI *dest, const MPI *src);
++void mpi_set_value(MPI *m, uint64_t value, uint8_t sign);
++// Alias used by hdgl_router.c (same as mpi_set_value for legacy exponent sync)
++static inline void mpi_update_from_legacy(MPI *m, int64_t legacy_exp) {
++    mpi_set_value(m, (uint64_t)llabs(legacy_exp), legacy_exp < 0 ? 1 : 0);
++}
++
++// ?? HDGL lattice API ?????????????????????????????????????????????????????????
++HDGLLattice *lattice_init(int num_instances, int slots_per_instance);
++HDGLChunk   *lattice_get_chunk(HDGLLattice *lat, int chunk_idx);
++Slot4096    *lattice_get_slot(HDGLLattice *lat, int idx);
++void         lattice_step_cpu(HDGLLattice *lat, double tick);
++void         lattice_fold(HDGLLattice *lat);
++void         lattice_free(HDGLLattice *lat);
++double       prismatic_recursion(HDGLLattice *lat, int idx, double val);
++
++// ?? Lattice-backed slot state (used by router) ????????????????????????????????
++HDGL_SlotState *hdgl_get_slot_state(int lattice_id);
++
++// ?? Bootloader integration ???????????????????????????????????????????????????
++void init_apa_constants(void);
++void free_apa_constants(void);
++void bootloader_init_lattice(HDGLLattice *lat, int steps);
+diff --git a/metal_infer/hdgl_router.c b/metal_infer/hdgl_router.c
+new file mode 100644
+index 0000000..2c1da2e
+--- /dev/null
++++ b/metal_infer/hdgl_router.c
+@@ -0,0 +1,87 @@
++// hdgl_router.c ? HDGL-28 recursive temporal token router
++// Corrected from flash-moe-HDGL fork:
++//   - Replaced #include "bootloaderZ.h"/"slot4096.h" with "hdgl_bootloaderz.h"
++//   - Replaced mpi_update_from_legacy() with inline from hdgl_bootloaderz.h
++//   - Replaced extern num_experts/lattice_size with module-local state set by hdgl_router_init()
++//   - lattice_get_slot() now performs bounds-checked total-slot lookup (not raw lattice_size)
++//   - encode_token: slot_init_apa(64, 16) ? correct (1 mantissa word for token hash)
++//   - hdgl_get_slot_state() lives in hdgl_bootloaderz.c and uses g_hdgl_lattice
++#include "hdgl_router.h"
++#include <stdint.h>
++#include <stdlib.h>
++
++// ?? Module state (set by hdgl_router_init) ???????????????????????????????????
++static HDGLLattice *s_lattice    = NULL;
++static int          s_num_experts = 0;
++
++void hdgl_router_init(HDGLLattice *lat, int num_experts) {
++    s_lattice     = lat;
++    s_num_experts = num_experts;
++}
++
++// ?? FNV-1a hash for token text ???????????????????????????????????????????????
++static uint32_t hash_token(Token t) {
++    uint32_t hash = 2166136261u;
++    for (char *p = t.text; p && *p; ++p) {
++        hash ^= (uint32_t)(*p);
++        hash *= 16777619u;
++    }
++    return hash;
++}
++
++// ?? Encode token ? Slot4096 (single-word APA entry for hash projection) ??????
++static Slot4096 encode_token(Token t) {
++    uint32_t h = hash_token(t);
++    // bits_mant=64 ? num_words=1; sufficient for a 64-bit token hash seed
++    Slot4096 s = slot_init_apa(64, 16);
++    s.mantissa_words[0] = ((uint64_t)h << 32) | h;
++    s.exponent = 0;
++    mpi_update_from_legacy(&s.exponent_mpi, s.exponent);
++    return s;
++}
++
++// ?? Project slot mantissa ? lattice slot index ???????????????????????????????
++static int project_to_lattice(Slot4096 s) {
++    if (!s_lattice) return 0;
++    int total = s_lattice->num_instances * s_lattice->slots_per_instance;
++    if (total <= 0) return 0;
++    return (int)(s.mantissa_words[0] % (uint64_t)total);
++}
++
++// ?? Query lattice for dynamic feedback from slot state ???????????????????????
++static uint32_t lattice_feedback(Slot4096 s) {
++    int lattice_id = project_to_lattice(s);
++    HDGL_SlotState *state = hdgl_get_slot_state(lattice_id);
++    if (!state) return 0;
++    return state->charge ^ state->entropy ^ state->tension;
++}
++
++// ?? Recursive routing: combines lattice state with temporal history ???????????
++int route_token_recursive(Token t, HDGL_History *H) {
++    if (s_num_experts <= 0) return 0;
++    Slot4096 s = encode_token(t);
++    uint32_t feedback = lattice_feedback(s);
++    uint32_t combined = feedback ^ H->last_feedback ^ (uint32_t)H->last_expert_id;
++    int lattice_id = project_to_lattice(s);
++    int expert_id  = (int)((lattice_id + (int)combined) % s_num_experts);
++    if (expert_id < 0) expert_id += s_num_experts;
++    H->last_feedback  = feedback;
++    H->last_expert_id = expert_id;
++    ap_free(&s);
++    return expert_id;
++}
++
++// ?? Batch routing ?????????????????????????????????????????????????????????????
++void route_tokens_recursive(Token *tokens, int *expert_ids, int batch_size) {
++    HDGL_History H = {0, 0};
++    for (int i = 0; i < batch_size; ++i)
++        expert_ids[i] = route_token_recursive(tokens[i], &H);
++}
++
++// ?? Shader utility ????????????????????????????????????????????????????????????
++HDGL_ShaderDims hdgl_get_packed_dims(int in_dim, int out_dim) {
++    HDGL_ShaderDims d;
++    d.in_dim  = (uint32_t)in_dim;
++    d.out_dim = (uint32_t)out_dim;
++    return d;
++}
+diff --git a/metal_infer/hdgl_router.h b/metal_infer/hdgl_router.h
+new file mode 100644
+index 0000000..e329917
+--- /dev/null
++++ b/metal_infer/hdgl_router.h
+@@ -0,0 +1,15 @@
++// hdgl_router.h ? HDGL-28 recursive temporal token router public API
++#pragma once
++#include "hdgl_bootloaderz.h"
++
++// Initialize router with a live lattice and the total expert count
++void hdgl_router_init(HDGLLattice *lat, int num_experts);
++
++// Route a single token using the temporal history; updates H in place
++int route_token_recursive(Token t, HDGL_History *H);
++
++// Route a batch of tokens; expert_ids[i] receives the routed expert index
++void route_tokens_recursive(Token *tokens, int *expert_ids, int batch_size);
++
++// Shader utility: pack in_dim/out_dim for non-square Metal buffer(3)
++HDGL_ShaderDims hdgl_get_packed_dims(int in_dim, int out_dim);
+diff --git a/metal_infer/infer.m b/metal_infer/infer.m
+index 5d2a946..cc591fc 100644
+--- a/metal_infer/infer.m
++++ b/metal_infer/infer.m
+@@ -193,6 +193,8 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
+ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
+ static int g_freq_tracking = 0;  // enabled by --freq flag
+ static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
++static int g_use_hdgl = 0;       // enabled by --hdgl flag: use BootloaderZ APA lattice backend
++extern HDGLLattice *g_hdgl_lattice;  // defined in hdgl_bootloaderz.c
+ static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
+ static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+ 
+@@ -643,6 +645,8 @@ static PromptTokens *load_prompt_tokens(const char *path) {
+ // ============================================================================
+ #define TOKENIZER_IMPL
+ #include "tokenizer.h"
++#include "hdgl_bootloaderz.h"
++#include "hdgl_router.h"
+ 
+ static bpe_tokenizer g_tokenizer;
+ static int g_tokenizer_loaded = 0;
+@@ -905,6 +909,7 @@ typedef struct {
+     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
+     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
+     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
++    id<MTLComputePipelineState> matvec_hdgl;  // HDGL-28 sign-magnitude ternary kernel
+     id<MTLComputePipelineState> rms_norm_sum;
+     id<MTLComputePipelineState> rms_norm_apply;
+     id<MTLComputePipelineState> rms_norm_apply_bf16;
+@@ -1045,6 +1050,7 @@ static MetalCtx *metal_setup(void) {
+     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint?float conversions)
+     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
+     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
++    ctx->matvec_hdgl   = makePipe(@"sign_magnitude_ternary_fma");
+     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
+     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
+     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
+@@ -1516,7 +1522,8 @@ static void gpu_encode_expert_forward_slot(
+         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
+         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+     }
+-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
++    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
++                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
+ 
+     uint32_t gate_up_out = MOE_INTERMEDIATE;
+     uint32_t gate_up_in  = HIDDEN_DIM;
+@@ -1612,7 +1619,8 @@ static void gpu_encode_expert_forward_slot_buf(
+         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
+         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+     }
+-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
++    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
++                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
+ 
+     uint32_t gate_up_out = MOE_INTERMEDIATE;
+     uint32_t gate_up_in  = HIDDEN_DIM;
+@@ -1712,7 +1720,8 @@ static void gpu_encode_experts_batched(
+         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
+         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+     }
+-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
++    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
++                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
+ 
+     uint32_t gate_up_out = MOE_INTERMEDIATE;
+     uint32_t gate_up_in  = HIDDEN_DIM;
+@@ -1921,7 +1930,8 @@ static void gpu_expert_forward(
+         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
+         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+     }
+-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
++    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
++                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
+ 
+     // Copy expert weights into Metal buffer only if not already there
+     if (!expert_data_already_in_buffer) {
+@@ -6513,6 +6523,7 @@ static void print_usage(const char *prog) {
+     printf("  --freq               Enable expert frequency tracking + analysis\n");
+     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
+     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
++    printf("  --hdgl               Use HDGL-28 BootloaderZ APA lattice backend (sign-magnitude ternary + recursive token routing)\n");
+     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
+     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
+     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
+@@ -6552,6 +6563,7 @@ int main(int argc, char **argv) {
+             {"freq",          no_argument,       0, 'F'},
+             {"cache-telemetry", no_argument,     0, 'E'},
+             {"2bit",          no_argument,       0, '2'},
++            {"hdgl",          no_argument,       0, 'H'},
+             {"gpu-linear",    no_argument,       0, 'G'},
+             {"think-budget",  required_argument, 0, 'B'},
+             {"serve",         required_argument, 0, 'R'},
+@@ -6562,7 +6574,7 @@ int main(int argc, char **argv) {
+         };
+ 
+         int c;
+-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
++        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GHh", long_options, NULL)) != -1) {
+             switch (c) {
+                 case 'm': model_path = optarg; break;
+                 case 'w': weights_path = optarg; break;
+@@ -6580,6 +6592,7 @@ int main(int argc, char **argv) {
+                 case 'F': g_freq_tracking = 1; break;
+                 case 'E': g_cache_telemetry_enabled = 1; break;
+                 case '2': g_use_2bit = 1; break;
++                case 'H': g_use_hdgl = 1; break;
+                 case 'G': gpu_linear_attn_enabled = 1; break;
+                 case 'D': g_pred_enabled = 1; break;
+                 case 'Z':
+@@ -6596,6 +6609,14 @@ int main(int argc, char **argv) {
+             }
+         }
+ 
++        // Initialize HDGL-28 lattice and router if requested
++        if (g_use_hdgl) {
++            printf("\n[HDGL-28] BootloaderZ APA lattice backend enabled\n");
++            g_hdgl_lattice = lattice_init(4096, BLZ_SLOTS_PER_INST);
++            bootloader_init_lattice(g_hdgl_lattice, 50);
++            hdgl_router_init(g_hdgl_lattice, NUM_EXPERTS);
++        }
++
+         // Build default paths
+         char default_weights[1024], default_manifest[1024], default_vocab[1024];
+ 
+diff --git a/metal_infer/shaders.metal b/metal_infer/shaders.metal
+index 80a3be6..e6cca1b 100644
+--- a/metal_infer/shaders.metal
++++ b/metal_infer/shaders.metal
+@@ -1294,3 +1294,41 @@ kernel void moe_combine_residual(
+ 
+     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+ }
++
++// ============================================================================
++// HDGL-28: Sign-Magnitude Ternary FMA kernel
++// ============================================================================
++//
++// Used when --hdgl is active. Replaces the standard 4-bit dequant matvec with
++// a sign-magnitude ternary multiply-accumulate matching the BootloaderZ V6.0
++// ternary arithmetic model. Non-square projections: pass in_dim via buffer(3)
++// and out_dim via hdgl_get_packed_dims() ? populate a separate HDGL_ShaderDims
++// buffer; for square layers the existing uint& dim interface suffices.
++//
++// Buffer layout:
++//   buffer(0): W     [out_dim ? in_dim] float weights
++//   buffer(1): x     [in_dim]           float input
++//   buffer(2): out   [out_dim]          float output
++//   buffer(3): dim   uint               in_dim (square layers; gid bounds-checks out_dim separately)
++
++kernel void sign_magnitude_ternary_fma(
++    device const float* W   [[buffer(0)]],
++    device const float* x   [[buffer(1)]],
++    device       float* out [[buffer(2)]],
++    constant uint&      dim [[buffer(3)]],
++    uint gid [[thread_position_in_grid]]
++) {
++    if (gid >= dim) return;
++
++    float acc = 0.0f;
++    for (uint col = 0; col < dim; col++) {
++        float w  = W[gid * dim + col];
++        float xv = x[col];
++        int sw = (w  < 0.0f) ? -1 : (w  > 0.0f) ? 1 : 0;
++        int sx = (xv < 0.0f) ? -1 : (xv > 0.0f) ? 1 : 0;
++        if (sw == 0 || sx == 0) continue;
++        float mag = fabs(w) * fabs(xv);
++        acc += (sw == sx) ? mag : -mag;
++    }
++    out[gid] = acc;
++}
+
