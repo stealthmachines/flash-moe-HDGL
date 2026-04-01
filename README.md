@@ -2,7 +2,7 @@
 
 **Running a 397B-parameter Mixture-of-Experts model with optional ultra-high-precision APA lattice backend.**
 
-This is the original **Flash-MoE** engine (pure C/Metal, SSD-streamed 4-bit/2-bit experts, 4.4+ tok/s on M3 Max) now bolstered with the **BootloaderZ V6.0 Arbitrary Precision Architecture (APA)** and **HDGL (Hyper-Dimensional Geometric Lattice)** from https://forum.zchg.org/t/bootloaderz-in-c-base4096-you-hypervisor-and-me/865.
+This is the original **Flash-MoE** engine (pure C/Metal, SSD-streamed 4-bit/2-bit experts, 4.4+ tok/s on M3 Max - https://github.com/danveloper/flash-moe ) now bolstered with the **BootloaderZ V6.0 Arbitrary Precision Architecture (APA)** and **HDGL (Hyper-Dimensional Geometric Lattice)** from https://forum.zchg.org/t/bootloaderz-in-c-base4096-you-hypervisor-and-me/865.
 
 - **Normal mode** — unchanged fast 4-bit MoE inference (production quality, tool calling).
 - **HDGL-28 mode** (`--hdgl`) — deterministic **Prismatic Router** + **Tertiary Experts** (Precision, Verification, Geometric, Recursive) using full **Slot4096** (4096-bit mantissa) and sign-magnitude ternary arithmetic. Slower (~0.6–1.5 tok/s) but hallucination-resistant and grounded in geometric necessity.
