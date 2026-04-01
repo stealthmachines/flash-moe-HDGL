@@ -1056,8 +1056,8 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
 
     // HDGL bootloaderz hooks
-    ctx->hdgl_boot = makePipe(@"hdgl_bootloaderz");
-    ctx->hdgl_route = makePipe(@"hdgl_router");
+ //   ctx->hdgl_boot = makePipe(@"hdgl_bootloaderz");
+ //   ctx->hdgl_route = makePipe(@"hdgl_router");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
