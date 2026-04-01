@@ -500,6 +500,7 @@ int main(int argc, char **argv) {
         {"show-think",  no_argument,       0, 's'},
         {"resume",      required_argument, 0, 'r'},
         {"sessions",    no_argument,       0, 'l'},
+        {"hdgl",        no_argument,       0, 'H'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -507,13 +508,17 @@ int main(int argc, char **argv) {
     init_sessions_dir();
 
     int c;
-    while ((c = getopt_long(argc, argv, "p:t:sr:lh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:t:sr:lHh", long_options, NULL)) != -1) {
         switch (c) {
             case 'p': port = atoi(optarg); break;
             case 't': max_tokens = atoi(optarg); break;
             case 's': show_thinking = 1; break;
             case 'r': resume_id = optarg; break;
             case 'l': session_list(); return 0;
+            case 'H':
+                printf("\n[HDGL-28] Hypervisor-MoE Bolstered ? BootloaderZ APA Lattice + Prismatic Router\n");
+                printf("You, Hypervisor; and Me\n\n");
+                break;
             case 'h':
                 printf("Usage: %s [options]\n", argv[0]);
                 printf("  --port N         Server port (default: 8000)\n");
@@ -521,6 +526,7 @@ int main(int argc, char **argv) {
                 printf("  --show-think     Show <think> blocks (dimmed)\n");
                 printf("  --resume ID      Resume a previous session\n");
                 printf("  --sessions       List saved sessions\n");
+                printf("  --hdgl           Enable HDGL-28 APA lattice mode (requires --hdgl on infer server)\n");
                 printf("  --help           This message\n");
                 return 0;
             default: return 1;

@@ -193,6 +193,10 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_use_hdgl = 0;       // enabled by --hdgl flag: use BootloaderZ APA lattice backend
+extern HDGLLattice *g_hdgl_lattice;  // defined in hdgl_bootloaderz.c
+static HDGL_History g_hdgl_history[NUM_LAYERS];  // per-layer temporal routing history
+static float g_hdgl_alpha = 0.20f;  // blend weight: 0=pure MoE, 1=pure HDGL
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -643,6 +647,8 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 // ============================================================================
 #define TOKENIZER_IMPL
 #include "tokenizer.h"
+#include "hdgl_bootloaderz.h"
+#include "hdgl_router.h"
 
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
@@ -905,6 +911,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_hdgl;  // HDGL-28 sign-magnitude ternary kernel
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1042,12 +1049,18 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
-    ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
-    ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
-    ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
+    ctx->matvec_v5      = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
+    ctx->matvec_fast    = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->matvec_2bit    = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_hdgl    = makePipe(@"sign_magnitude_ternary_fma");
+
+    ctx->rms_norm_sum   = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
+
+    // HDGL bootloaderz hooks
+ //   ctx->hdgl_boot = makePipe(@"hdgl_bootloaderz");
+ //   ctx->hdgl_route = makePipe(@"hdgl_router");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
@@ -1516,7 +1529,8 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1612,7 +1626,8 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1712,7 +1727,8 @@ static void gpu_encode_experts_batched(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1921,7 +1937,8 @@ static void gpu_expert_forward(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -2709,6 +2726,19 @@ static void moe_forward(
 
     // Softmax routing scores
     cpu_softmax(gate_scores, NUM_EXPERTS);
+
+    // ---- HDGL-28 left-brain / right-brain bridge ────────────────────────────
+    if (g_use_hdgl && g_hdgl_lattice) {
+        char tok_buf[32];
+        snprintf(tok_buf, sizeof(tok_buf), "%d:0", layer_idx);
+        Token hdgl_tok = { tok_buf, layer_idx * 10000 };
+        HDGL_History *H = &g_hdgl_history[layer_idx];
+        int hdgl_expert = route_token_recursive(hdgl_tok, H);
+        if (hdgl_expert >= 0 && hdgl_expert < NUM_EXPERTS)
+            gate_scores[hdgl_expert] += g_hdgl_alpha;
+        cpu_softmax(gate_scores, NUM_EXPERTS);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Top-K expert selection
     int expert_indices[64];
@@ -5030,6 +5060,28 @@ static void fused_layer_forward(
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
     cpu_softmax(gate_scores, NUM_EXPERTS);
+
+    // ---- HDGL-28 left-brain / right-brain bridge ────────────────────────────
+    // The MoE gate (left brain) scores experts from the current hidden state.
+    // The HDGL lattice router (right brain) contributes a temporal signal derived
+    // from sequence history across this layer.  We blend the two signals before
+    // top-K selection so neither fully overrides the other.
+    if (g_use_hdgl && g_hdgl_lattice) {
+        char tok_buf[32];
+        snprintf(tok_buf, sizeof(tok_buf), "%d:%d", layer_idx, pos);
+        Token hdgl_tok = { tok_buf, layer_idx * 10000 + pos };
+        HDGL_History *H = &g_hdgl_history[layer_idx];
+        int hdgl_expert = route_token_recursive(hdgl_tok, H);
+        // Soft boost: add alpha to the HDGL-preferred expert score, renormalise
+        if (hdgl_expert >= 0 && hdgl_expert < NUM_EXPERTS)
+            gate_scores[hdgl_expert] += g_hdgl_alpha;
+        cpu_softmax(gate_scores, NUM_EXPERTS);  // renormalise after boost
+        if (g_timing_enabled) {
+            // accounted under routing_cpu — no separate counter needed
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
@@ -6513,6 +6565,8 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --hdgl               Use HDGL-28 BootloaderZ APA lattice backend (sign-magnitude ternary + recursive token routing)\n");
+    printf("  --hdgl-alpha N       Blend weight for HDGL routing signal (default: 0.20, range 0.0-1.0)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6552,6 +6606,8 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"hdgl",          no_argument,       0, 'H'},
+            {"hdgl-alpha",    required_argument, 0, 'A'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6562,7 +6618,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:LSTFE2GHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6580,6 +6636,8 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case 'H': g_use_hdgl = 1; break;
+                case 'A': g_hdgl_alpha = strtof(optarg, NULL); break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -6594,6 +6652,14 @@ int main(int argc, char **argv) {
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        // Initialize HDGL-28 lattice and router if requested
+        if (g_use_hdgl) {
+            printf("\n[HDGL-28] BootloaderZ APA lattice backend enabled\n");
+            g_hdgl_lattice = lattice_init(4096, BLZ_SLOTS_PER_INST);
+            bootloader_init_lattice(g_hdgl_lattice, 50);
+            hdgl_router_init(g_hdgl_lattice, NUM_EXPERTS);
         }
 
         // Build default paths
