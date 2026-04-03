@@ -64,6 +64,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <compression.h>
+#include "hdgl_bootloaderz.h"
+#include "hdgl_router.h"
 
 // ============================================================================
 // Model constants
@@ -193,6 +195,11 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_use_hdgl = 0;       // enabled by --hdgl flag: use BootloaderZ APA lattice backend
+extern HDGLLattice *g_hdgl_lattice;  // defined in hdgl_bootloaderz.c
+static HDGL_History g_hdgl_history[NUM_LAYERS];  // per-layer temporal routing history
+static float g_hdgl_alpha = 0.20f;  // blend weight: 0=pure MoE, 1=pure HDGL
+static const char *g_hdgl_load_path = NULL;  // pre-seeded lattice file (--hdgl-load)
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -905,6 +912,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
+    id<MTLComputePipelineState> matvec_hdgl;  // HDGL-28 sign-magnitude ternary kernel
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1041,11 +1049,12 @@ static MetalCtx *metal_setup(void) {
         return ps;
     };
 
-    ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
-    ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
-    ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
-    ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
+    ctx->matvec_v3      = makePipe(@"dequant_matvec_4bit_v3");
+    ctx->matvec_v5      = makePipe(@"dequant_matvec_4bit_v5");
+    ctx->matvec_fast    = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->matvec_2bit    = makePipe(@"dequant_matvec_2bit");
+    ctx->matvec_hdgl    = makePipe(@"sign_magnitude_ternary_fma");
+    ctx->rms_norm_sum   = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
@@ -1516,7 +1525,8 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1612,7 +1622,8 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1712,7 +1723,8 @@ static void gpu_encode_experts_batched(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1921,7 +1933,8 @@ static void gpu_expert_forward(
         up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
         down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = g_use_hdgl  ? ctx->matvec_hdgl :
+                                              g_use_2bit  ? ctx->matvec_2bit : ctx->matvec_v3;
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -2710,6 +2723,19 @@ static void moe_forward(
     // Softmax routing scores
     cpu_softmax(gate_scores, NUM_EXPERTS);
 
+    if (g_use_hdgl && g_hdgl_lattice) {
+        char tok_buf[32];
+        float h_rms = vec_rms(hidden, HIDDEN_DIM);
+        uint32_t rms_fp = (uint32_t)(h_rms * 1000.0f) & 0xFFFF;
+        snprintf(tok_buf, sizeof(tok_buf), "%d:%04x", layer_idx, rms_fp);
+        Token hdgl_tok = { tok_buf, layer_idx * 10000 + (int)rms_fp };
+        HDGL_History *H = &g_hdgl_history[layer_idx];
+        int hdgl_expert = route_token_recursive(hdgl_tok, H);
+        if (hdgl_expert >= 0 && hdgl_expert < NUM_EXPERTS)
+            gate_scores[hdgl_expert] += g_hdgl_alpha;
+        cpu_softmax(gate_scores, NUM_EXPERTS);
+    }
+
     // Top-K expert selection
     int expert_indices[64];
     float expert_weights[64];
@@ -2844,6 +2870,16 @@ static void moe_forward(
                 layer_idx, vec_rms(h_mid, HIDDEN_DIM), vec_rms(moe_out, HIDDEN_DIM),
                 vec_rms(shared_out, HIDDEN_DIM), shared_weight,
                 vec_rms(hidden, HIDDEN_DIM));
+    }
+
+    if (g_use_hdgl && g_hdgl_lattice) {
+        int hdgl_exp_stored = g_hdgl_history[layer_idx].last_expert_id;
+        int agreed = 0;
+        for (int _k = 0; _k < K; _k++) {
+            if (expert_indices[_k] == hdgl_exp_stored) { agreed = 1; break; }
+        }
+        float moe_rms = vec_rms(moe_out, HIDDEN_DIM);
+        hdgl_lattice_feedback(layer_idx, hdgl_exp_stored, agreed, moe_rms);
     }
 
     free(h_post);
@@ -5030,6 +5066,18 @@ static void fused_layer_forward(
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
     cpu_softmax(gate_scores, NUM_EXPERTS);
+    if (g_use_hdgl && g_hdgl_lattice) {
+        char tok_buf[48];
+        float h_rms2 = vec_rms(h_post, HIDDEN_DIM);
+        uint32_t rms_fp2 = (uint32_t)(h_rms2 * 1000.0f) & 0xFFFF;
+        snprintf(tok_buf, sizeof(tok_buf), "%d:%d:%04x", layer_idx, pos, rms_fp2);
+        Token hdgl_tok = { tok_buf, layer_idx * 10000 + pos };
+        HDGL_History *H = &g_hdgl_history[layer_idx];
+        int hdgl_expert = route_token_recursive(hdgl_tok, H);
+        if (hdgl_expert >= 0 && hdgl_expert < NUM_EXPERTS)
+            gate_scores[hdgl_expert] += g_hdgl_alpha;
+        cpu_softmax(gate_scores, NUM_EXPERTS);
+    }
     int expert_indices[64];
     float expert_weights[64];
     cpu_topk(gate_scores, NUM_EXPERTS, K, expert_indices, expert_weights);
@@ -5537,6 +5585,16 @@ static void fused_layer_forward(
     // ---- Final combine: hidden = h_mid + moe_out + shared_out ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
+    }
+
+    if (g_use_hdgl && g_hdgl_lattice) {
+        int hdgl_exp_stored = g_hdgl_history[layer_idx].last_expert_id;
+        int agreed = 0;
+        for (int _k = 0; _k < K; _k++) {
+            if (expert_indices[_k] == hdgl_exp_stored) { agreed = 1; break; }
+        }
+        float moe_rms = vec_rms(moe_out, HIDDEN_DIM);
+        hdgl_lattice_feedback(layer_idx, hdgl_exp_stored, agreed, moe_rms);
     }
 
     if (g_timing_enabled) {
@@ -6513,6 +6571,9 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --hdgl               Use HDGL-28 v%s APA lattice + spiral8 double-strand routing\n", HDGL_VERSION_STR);
+    printf("  --hdgl-alpha N       Blend weight for HDGL routing signal (default: 0.20, range 0.0-1.0)\n");
+    printf("  --hdgl-load FILE     Load pre-seeded lattice from FILE (generated by generate_hdgl_lattice)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6552,6 +6613,9 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"hdgl",          no_argument,       0, 'H'},
+            {"hdgl-alpha",    required_argument, 0, 'A'},
+            {"hdgl-load",     required_argument, 0, 'X'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6562,7 +6626,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:X:LSTFE2GHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6580,6 +6644,9 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case 'H': g_use_hdgl = 1; break;
+                case 'A': g_hdgl_alpha = strtof(optarg, NULL); break;
+                case 'X': g_hdgl_load_path = optarg; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -6594,6 +6661,24 @@ int main(int argc, char **argv) {
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+
+        if (g_use_hdgl) {
+            printf("\n[HDGL-28] BootloaderZ APA lattice v%s\n", HDGL_VERSION_STR);
+            g_hdgl_lattice = lattice_init(4096, BLZ_SLOTS_PER_INST);
+            if (g_hdgl_load_path) {
+                printf("[HDGL-28] Loading pre-seeded lattice from: %s\n", g_hdgl_load_path);
+                init_apa_constants();
+                if (!hdgl_load_lattice(g_hdgl_lattice, g_hdgl_load_path)) {
+                    printf("[HDGL-28] Load failed, falling back to seeding\n");
+                    bootloader_init_lattice(g_hdgl_lattice, 50);
+                } else {
+                    printf("[HDGL-28] Lattice load successful\n");
+                }
+            } else {
+                bootloader_init_lattice(g_hdgl_lattice, 50);
+            }
+            hdgl_router_init(g_hdgl_lattice, NUM_EXPERTS);
         }
 
         // Build default paths

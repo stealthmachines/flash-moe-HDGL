@@ -21,6 +21,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 LDFLAGS = -lpthread -lcompression
 
 TARGET = metal_infer
+EXTRA_C = hdgl_bootloaderz.c hdgl_router.c
 MAIN_SRC = main.m
 
 # Optional: offline shader compilation (faster startup, but not required)
@@ -56,15 +57,23 @@ $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
 # Build the inference engine
-$(INFER_TARGET): $(INFER_SRC)
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
+$(INFER_TARGET): $(INFER_SRC) $(EXTRA_C)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) $(EXTRA_C) -o $(INFER_TARGET)
 
 # Build the chat client (thin HTTP/SSE client + linenoise line editor)
-$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h
-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c -o $(CHAT_TARGET)
+$(CHAT_TARGET): $(CHAT_SRC) linenoise.c linenoise.h $(EXTRA_C)
+	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(CHAT_SRC) linenoise.c $(EXTRA_C) -o $(CHAT_TARGET)
+
+generate_hdgl_lattice: hdgl_lattice_generator.c $(EXTRA_C)
+	$(CC) -O3 -Wall -I. hdgl_lattice_generator.c $(EXTRA_C) -o generate_hdgl_lattice -lm
+
+# Pre-seed a lattice file (run once before inference for faster startup)
+# Usage: make hdgl-preseed  ->  creates hdgl_lattice.bin
+hdgl-preseed: generate_hdgl_lattice
+	./generate_hdgl_lattice --instances 4096 --steps 200 --output hdgl_lattice.bin
 
 clean:
-	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(CHAT_TARGET) $(SHADER_AIR) $(SHADER_LIB) generate_hdgl_lattice hdgl_lattice.bin
 
 # Run targets
 run: $(TARGET)

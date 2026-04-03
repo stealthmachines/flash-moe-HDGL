@@ -1294,3 +1294,56 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+// ============================================================================
+// HDGL-28 v2.0: Sign-Magnitude Ternary FMA kernel
+// ============================================================================
+struct HDGL_ShaderDims { uint in_dim; uint out_dim; };
+
+kernel void sign_magnitude_ternary_fma(
+    device const float*       W    [[buffer(0)]],
+    device const float*       x    [[buffer(1)]],
+    device       float*       out  [[buffer(2)]],
+    constant HDGL_ShaderDims& dims [[buffer(3)]],
+    uint gid     [[thread_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    const uint out_dim = dims.out_dim;
+    const uint in_dim  = dims.in_dim;
+    if (gid >= out_dim) return;
+
+    constexpr uint TILE = 256;
+    threadgroup float x_shared[TILE];
+
+    float acc = 0.0f;
+    const uint row = gid;
+
+    for (uint base = 0; base < in_dim; base += TILE) {
+        const uint chunk = min(TILE, in_dim - base);
+
+        for (uint i = lid; i < chunk; i += tg_size)
+            x_shared[i] = x[base + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint col = 0;
+        for (; col + 4 <= chunk; col += 4) {
+            float4 w4  = float4(W[row*in_dim + base+col],
+                                W[row*in_dim + base+col+1],
+                                W[row*in_dim + base+col+2],
+                                W[row*in_dim + base+col+3]);
+            float4 xv4 = float4(x_shared[col], x_shared[col+1],
+                                x_shared[col+2], x_shared[col+3]);
+            acc += dot(sign(w4) * sign(xv4) * fabs(w4) * fabs(xv4), float4(1.0f));
+        }
+        for (; col < chunk; col++) {
+            float w  = W[row*in_dim + base + col];
+            float xv = x_shared[col];
+            acc += sign(w) * sign(xv) * fabs(w) * fabs(xv);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    out[row] = acc;
+}
