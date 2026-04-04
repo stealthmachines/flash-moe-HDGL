@@ -1,3 +1,5 @@
+# WARNING: This repo uses Abitrary Precision, which has been known to break computers.  My suspicion is that this may be caused by echo or feedback.  This shouldn't scare you away if you're a researcher, rather it shows the computational power almost transcends its own virtual environment by breaking hardware.  Cool.  But yeah, be careful if you use this code, as damage has been known to happen.  To solve this, I have developed this over here which may help in the future to isolate the echo chambers to a form which is contained or controlled - https://github.com/stealthmachines/AnalogContainer1
+
 # Flash-MoE + HDGL-28: Hybrid Inference on a 397B Parameter Model
 
 > **[Read the original paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built the Flash-MoE engine in 24 hours.
