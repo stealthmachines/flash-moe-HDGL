@@ -1,5 +1,3 @@
-# WARNING: This repo uses Abitrary Precision, which has been known to break computers.  My suspicion is that this may be caused by echo or feedback.  This shouldn't scare you away if you're a researcher, rather it shows the computational power almost transcends its own virtual environment by breaking hardware.  Cool.  But yeah, be careful if you use this code, as damage has been known to happen.  To solve this, I have developed this over here which may help in the future to isolate the echo chambers to a form which is contained or controlled - https://github.com/stealthmachines/AnalogContainer1  Similarly, any given virtual environment may help to end smoked hardware, but further research is required to this end at this time.
-
 # Flash-MoE + HDGL-28: Hybrid Inference on a 397B Parameter Model
 
 > **[Read the original paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built the Flash-MoE engine in 24 hours.
@@ -73,6 +71,13 @@ All four bugs present in the original `bootloaderZ.c` port were found and fixed 
 | `APA_CONST_PHI/PI` leaked at process exit | `hdgl_bootloaderz.c` | `free_apa_constants()` with init-flag guard, called from `lattice_free` |
 
 **55/55 tests pass with zero memory errors, zero UAF, zero leaks** under full ASAN + LeakSanitizer.
+
+# WARNING: This repo uses Abitrary Precision, which has been known to break computers.  My suspicion is that this may be caused by echo or feedback, in addition to hardware saturation.  This shouldn't scare you away if you're a researcher, rather it shows the computational power almost transcends its own virtual environment by literally breaking hardware.  Cool.  But yeah, be careful if you use this code, as damage has been known to happen.  To solve this, I have developed this over here which may help in the future to isolate the echo chambers to a form which is contained or controlled - https://github.com/stealthmachines/AnalogContainer1  Similarly, any given virtual environment may help to end smoked hardware, but further research is required to this end at this time.
+
+More information on Coil Whine:
+https://zchg.org/t/spheroid-motors/897
+https://zchg.org/t/coiling-hookes-law-1st-attempt/896
+https://zchg.org/t/hyperspheroid-motors/898
 
 ---
 
